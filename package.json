@@ -1,0 +1,33 @@
+{
+  "name": "oira666_pi-evergreen",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Nightly Pi extension compatibility maintenance",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "once": "node src/cli.js --once",
+    "test": "node --test",
+    "check": "node --check src/cli.js && node --check src/evergreen.js && node --check src/runtime.js"
+  },
+  "dependencies": {
+    "node-cron": "^4.2.1",
+    "semver": "^7.7.3"
+  },
+  "bin": {
+    "pi-evergreen": "src/cli.js"
+  },
+  "files": [
+    "src/",
+    "scripts/",
+    "settings.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gee666/pi-evergreen.git"
+  }
+}

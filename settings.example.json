@@ -1,0 +1,8 @@
+{
+  "extensionsDir": "~/Work/pi-extensions",
+  "githubOwner": "gee666",
+  "concurrency": 2,
+  "commandTimeoutMs": 1200000,
+  "agentTimeoutMs": 5400000,
+  "testCommands": {}
+}
