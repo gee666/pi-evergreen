@@ -4,6 +4,7 @@ import semver from 'semver';
 import { command, json, save, lock, pool } from './runtime.js';
 import { readKnowledge, writeKnowledge, writeTestCommands, workerReport } from './metadata.js';
 import { cleanup } from './cleanup.js';
+import { resolvePiBinary } from './pi-runtime.js';
 
 export function parseVersion(text) {
   const match = text.match(/(?:^|\s)v?(\d+\.\d+\.\d+(?:-[\w.-]+)?)(?:\s|$)/);
@@ -39,8 +40,58 @@ export async function discover(run, owner) {
     : `users/${owner}/repos?per_page=100&type=owner`;
   const pages = JSON.parse(await run('gh', ['api', '--paginate', '--slurp', endpoint]));
   const repos = activeRepos(pages.flat(), owner);
-  if (!repos.length) throw new Error(`No active pi-* repositories found for ${owner}`);
   return repos;
+}
+
+export function dependsOnPi(pkg) {
+  const hosts = ['pi-coding-agent', 'pi-ai', 'pi-agent-core', 'pi-tui'];
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies, ...pkg.peerDependencies, ...pkg.optionalDependencies };
+  if (Object.entries(deps).some(([name, spec]) => hosts.some(host => name === '@earendil-works/' + host || name === '@mariozechner/' + host || (typeof spec === 'string' && new RegExp('^npm:@(?:earendil-works|mariozechner)/' + host + '(?:@|$)').test(spec))))) return true;
+  // Pi resources depend on the host's extension or resource-format contract.
+  return pkg.pi && typeof pkg.pi === 'object' && ['extensions', 'themes', 'skills', 'prompts'].some(key => Array.isArray(pkg.pi[key]) && pkg.pi[key].some(value => typeof value === 'string' && value.trim()));
+}
+
+const notFound = error => /HTTP 404|E404/.test(error.message);
+export async function eligibleRepos(run, repos) {
+  const eligible = [];
+  for (const repo of repos) {
+    try {
+      const data = JSON.parse(await run('gh', ['api', `repos/${repo.owner}/${repo.name}/contents/package.json?ref=${encodeURIComponent(repo.branch)}`]));
+      const pkg = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+      if (dependsOnPi(pkg)) eligible.push(repo);
+      else console.log(`Skipping ${repo.name}: no Pi SDK dependency or Pi resource manifest.`);
+    } catch (error) {
+      if (!notFound(error)) throw error;
+      console.log(`Skipping ${repo.name}: repository or package manifest no longer available.`);
+    }
+  }
+  return eligible;
+}
+
+export function retireRepository(state, name, reason) {
+  state.retired ||= {};
+  state.retired[name] = { at: new Date().toISOString(), reason, release: state.releases?.[name], worker: state.workerReports?.[name] };
+  delete state.releases?.[name];
+  delete state.workerReports?.[name];
+  delete state.coverageAudits?.[name];
+  // Preserve local edits, ownership history and notes. Retirement never deletes source.
+}
+export function reconcileRepositories(state, repos) {
+  const names = new Set(repos.map(r => r.name));
+  const known = new Set([...Object.keys(state.checkouts || {}), ...Object.keys(state.releases || {}), ...Object.keys(state.workerReports || {})]);
+  for (const name of known) if (!names.has(name) && !state.retired?.[name]) retireRepository(state, name, 'No longer an active, supported Pi-dependent repository');
+  for (const name of names) if (state.retired?.[name]) delete state.retired[name];
+}
+export async function assertRepositoryActive(run, repo) {
+  let data;
+  try { data = JSON.parse(await run('gh', ['api', `repos/${repo.owner}/${repo.name}`])); }
+  catch (error) { if (!notFound(error)) throw error; }
+  if (!data || data.archived || data.disabled) {
+    const error = new Error(`${repo.name} was deleted, archived or disabled; stopped maintenance.`);
+    error.retired = true;
+    throw error;
+  }
+  if (data.name !== repo.name || data.owner?.login.toLowerCase() !== repo.owner.toLowerCase()) throw new Error('Repository identity changed');
 }
 
 export async function assertClean(run, cwd) {
@@ -122,7 +173,7 @@ export async function testRepo(run, repo, config, logDir, label) {
     if (!commands.length) throw new Error('No test script. Add real tests or configure testCommands for this repository.');
     if (pkg.scripts?.['test:e2e'] && !commands.some(c => /(?:^|\s)test:e2e(?:\s|$)/.test(c))) commands.push('npm run test:e2e');
     const outputs = [];
-    for (let i = 0; i < commands.length; i++) outputs.push(await run('bash', ['-o', 'pipefail', '-c', commands[i]], { cwd: repo.dir, env: { PI_EVERGREEN_E2E: '1', PI_EVERGREEN_E2E_PROVIDER: config.e2eProvider, PI_EVERGREEN_E2E_MODEL: config.e2eModel, PI_EVERGREEN_E2E_REASONING: config.e2eReasoning }, logFile: path.join(logDir, `${repo.name}-${label}-${i}.log`) }));
+    for (let i = 0; i < commands.length; i++) outputs.push(await run('bash', ['-o', 'pipefail', '-c', commands[i]], { cwd: repo.dir, env: { PI_EVERGREEN_E2E: '1', PI_EVERGREEN_PI_BIN: config.piBin, PI_EVERGREEN_E2E_PROVIDER: config.e2eProvider, PI_EVERGREEN_E2E_MODEL: config.e2eModel, PI_EVERGREEN_E2E_REASONING: config.e2eReasoning }, logFile: path.join(logDir, `${repo.name}-${label}-${i}.log`) }));
     return { passed: true, summary: outputs.join('\n').slice(-16000) };
   } catch (error) { return { passed: false, summary: error.message }; }
 }
@@ -131,15 +182,15 @@ async function exists(file) {
 }
 
 export async function piSession(run, config, cwd, prompt, logFile, readOnly = false) {
-  return run('pi', ['--print', '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-approve',
+  return run(config.piBin || 'pi', ['--print', '--no-session', '--no-extensions', '--no-skills', '--no-prompt-templates', '--no-approve',
     '--provider', config.provider, '--model', config.model, '--thinking', config.reasoning,
     ...(readOnly ? ['--no-tools'] : ['--tools', 'read,bash,edit,write,grep,find,ls']),
-    '--', 'Follow the task supplied on stdin.'], { cwd, input: prompt, timeout: config.agentTimeoutMs, logFile });
+    '--', 'Follow the task supplied on stdin.'], { cwd, input: prompt, timeout: config.agentTimeoutMs, logFile, env: { PI_EVERGREEN_PI_BIN: config.piBin, PI_EVERGREEN_E2E_PROVIDER: config.e2eProvider, PI_EVERGREEN_E2E_MODEL: config.e2eModel, PI_EVERGREEN_E2E_REASONING: config.e2eReasoning } });
 }
 export const knowledgeFile = 'extensions.md';
 export const reportInstructions = `Return your final answer ONLY as JSON with fields knowledge (a concise Markdown string for THIS extension) and testCommands (a nonempty array of the exact shell commands needed for its full tests/checks/build/e2e). Do not directly edit the shared Markdown file or application .env, and do not create a per-repository knowledge file. The parent merges only your extension's knowledge into .state/extensions.md and writes your commands to its dedicated PI-TEST-COMMANDS-<repo> entry in .env. Include all needed test suites, never replace a failing command with a weaker check. Keep test commands accurate after changes.`;
 export function intentTestInstructions(config, firstRun = false) {
-  return `${firstRun ? 'FIRST-RUN TEST AUDIT: spend substantial effort on coverage now so future runs can usually repair failing tests and move on.' : 'Preserve and improve intent-level regression coverage as needed.'} Enumerate each extension intent and observable invariant; map each to a meaningful test, identify gaps and add tests that fail when THE INTENT is violated, not merely when a helper implementation changes. Audit happy paths, errors and relevant lifecycle transitions. For fragile runtime integration, add end-to-end tests running the actual installed Pi CLI with this local extension explicitly loaded, not a mocked replacement function. Use harmless sentinel values and inspect real provider-bound prompts/requests plus session artifacts across multiple turns, retries, compaction or session transitions where relevant. Example: limits-wait must replace the intended system-prompt content in ALL places and turns: verify forbidden original sentinel text never leaks into any outbound prompt or location it should not reach. Checking one replacement helper, final model prose, or transcripts that omit system prompts is insufficient. Instrument a supported observer or actual transport boundary if necessary to observe effective outgoing prompts; prove the observer sees real requests, not a reconstructed expected prompt. Keep tests deterministic except where a real model is needed. Verify the regression test can actually detect a violated invariant, for example a negative control or a temporary reverted fix, without committing broken code. Record intent-to-test mappings and remaining limitations concisely in your shared ${knowledgeFile} section. Add an npm test:e2e script for needed live Pi tests; Evergreen runs it and must not silently skip required e2e coverage. E2E model credentials are separate from the maintenance model: use provider ${config.e2eProvider}, model ${config.e2eModel}, reasoning ${config.e2eReasoning}. Test code MUST honor PI_EVERGREEN_E2E_PROVIDER, PI_EVERGREEN_E2E_MODEL and PI_EVERGREEN_E2E_REASONING so the owner can change them later. Evergreen sets PI_EVERGREEN_E2E=1 during checks. Use the cheapest configured e2e model for real model calls, keep prompts and token budgets small, and do not use the maintenance model for e2e. Do not publish until all required intent and e2e tests actually pass.`;
+  return `${firstRun ? 'FIRST-RUN TEST AUDIT: spend substantial effort on coverage now so future runs can usually repair failing tests and move on.' : 'Preserve and improve intent-level regression coverage as needed.'} Enumerate each extension intent and observable invariant; map each to a meaningful test, identify gaps and add tests that fail when THE INTENT is violated, not merely when a helper implementation changes. Audit happy paths, errors and relevant lifecycle transitions. For fragile runtime integration, add end-to-end tests running the global Pi CLI from PI_EVERGREEN_PI_BIN, never npx pi or node_modules/.bin/pi. Do not download or install another Pi runtime. SDK dev dependencies may be used for types/unit validation, but all real CLI/e2e sessions must use the supplied global executable. Use that actual installed Pi CLI with this local extension explicitly loaded, not a mocked replacement function. Use harmless sentinel values and inspect real provider-bound prompts/requests plus session artifacts across multiple turns, retries, compaction or session transitions where relevant. Example: limits-wait must replace the intended system-prompt content in ALL places and turns: verify forbidden original sentinel text never leaks into any outbound prompt or location it should not reach. Checking one replacement helper, final model prose, or transcripts that omit system prompts is insufficient. Instrument a supported observer or actual transport boundary if necessary to observe effective outgoing prompts; prove the observer sees real requests, not a reconstructed expected prompt. Keep tests deterministic except where a real model is needed. Verify the regression test can actually detect a violated invariant, for example a negative control or a temporary reverted fix, without committing broken code. Record intent-to-test mappings and remaining limitations concisely in your shared ${knowledgeFile} section. Add an npm test:e2e script for needed live Pi tests; Evergreen runs it and must not silently skip required e2e coverage. E2E model credentials are separate from the maintenance model: use provider ${config.e2eProvider}, model ${config.e2eModel}, reasoning ${config.e2eReasoning}. Test code MUST honor PI_EVERGREEN_E2E_PROVIDER, PI_EVERGREEN_E2E_MODEL and PI_EVERGREEN_E2E_REASONING so the owner can change them later. Evergreen sets PI_EVERGREEN_E2E=1 during checks. Use the cheapest configured e2e model for real model calls, keep prompts and token budgets small, and do not use the maintenance model for e2e. Do not publish until all required intent and e2e tests actually pass.`;
 }
 export function usesUndocumentedApis(knowledge) {
   const marker = knowledge.match(/<!--\s*pi-evergreen:\s*(\{[^\n]*\})\s*-->/);
@@ -189,6 +240,7 @@ export async function release(run, repo, config, journals, persist, logDir) {
     const pkg = await json(path.join(cwd, 'package.json'));
     if (pkg.name !== policy.name || Boolean(pkg.private) !== Boolean(policy.private) || JSON.stringify(pkg.publishConfig) !== JSON.stringify(policy.publishConfig)) throw new Error('Publication target differs from the original package');
   }
+  await assertRepositoryActive(run, repo);
   if (!pending) {
     const dirty = await run('git', ['status', '--porcelain'], { cwd });
     if (!dirty) return; // An honest no-op review does not need an empty npm release.
@@ -233,11 +285,13 @@ export async function release(run, repo, config, journals, persist, logDir) {
   await assertClean(run, cwd);
   if (await run('git', ['rev-parse', 'HEAD'], { cwd }) !== pending.commit) throw new Error('Release HEAD changed');
   if (pending.phase === 'push') {
+    await assertRepositoryActive(run, repo);
     await run('git', ['push', 'origin', `HEAD:refs/heads/${repo.branch}`], { cwd });
     pending.phase = pending.publish === false ? 'done' : 'publish';
     await persist();
   }
   if (pending.phase === 'publish') {
+    await assertRepositoryActive(run, repo);
     // Retry publishing after interrupted runs without issuing another patch bump.
     const versions = await registryVersions(run, pending.package, cwd);
     if (!versions.includes(pending.version)) {
@@ -251,10 +305,9 @@ export async function release(run, repo, config, journals, persist, logDir) {
   }
 }
 
-// During self-repair the independent supervisor owns this app's tests/commit/deploy.
-// Do not start a second worker or auto-release its dirty canonical checkout.
+// Evergreen is maintained by its operator/repair supervisor, never by its extension workers.
 export function maintenanceRepos(repos, config, repairActive) {
-  return repos.filter(repo => !repairActive || !config.appDir || path.resolve(config.extensionsDir, repo.name) !== path.resolve(config.appDir));
+  return repos.filter(repo => repo.name !== 'pi-evergreen' && (!config.appDir || path.resolve(config.extensionsDir, repo.name) !== path.resolve(config.appDir)));
 }
 
 export async function evergreen(config, deps = {}) {
@@ -278,25 +331,33 @@ export async function evergreen(config, deps = {}) {
     // Complete journalled releases before installing a newer runtime.
     const unfinished = Object.entries(state.releases).filter(([, r]) => r.phase !== 'done');
     if (unfinished.length) {
-      const active = await discover(run, config.owner);
+      const active = await eligibleRepos(run, maintenanceRepos(await discover(run, config.owner), config));
+      reconcileRepositories(state, active);
+      await persist();
       for (const [name, journal] of unfinished) {
+        if (!state.releases[name]) continue;
         const meta = active.find(r => r.name === name);
         if (!meta || !journal.repo || journal.repo.owner !== meta.owner || journal.repo.branch !== meta.branch) throw new Error(`Pending release ${name} is not an active repository with the recorded identity`);
         const target = journal.piVersion || state.targetVersion;
         let recoverRun = run;
+        let piBin;
         if (journal.phase === 'prepare') {
-          // The tested runtime is explicit even if Pi was manually upgraded between runs.
-          await run('mise', ['install', `pi@${target}`]);
-          recoverRun = (bin, args, opts) => run('mise', ['exec', `pi@${target}`, '--', bin, ...args], opts);
+          piBin = await (deps.resolvePi || resolvePiBinary)(run);
+          const installed = parseVersion(await run(piBin, ['--version']));
+          if (installed !== target) throw new Error(`Pending release targets Pi ${target}, but global Pi is ${installed}; it needs a renewed compatibility audit. No additional Pi runtime will be installed.`);
         }
-        await release(recoverRun, journal.repo, { ...config, piVersion: target }, state.releases, persist, logDir);
+        try { await release(recoverRun, journal.repo, { ...config, piVersion: target, piBin }, state.releases, persist, logDir); }
+        catch (error) { if (!error.retired) throw error; retireRepository(state, name, error.message); await persist(); }
       }
     }
     const current = await updatePi(run);
-    config = { ...config, piVersion: current };
+    config = { ...config, piVersion: current, piBin: await (deps.resolvePi || resolvePiBinary)(run) };
     state.observedVersion = current;
     await persist();
-    const repos = maintenanceRepos(await discover(run, config.owner), config, deps.repairActive ?? process.env.PI_EVERGREEN_REPAIR_ACTIVE === '1');
+    const repos = await eligibleRepos(run, maintenanceRepos(await discover(run, config.owner), config));
+    reconcileRepositories(state, repos);
+    await persist();
+    if (!repos.length) { state.version = current; state.completedAt = new Date().toISOString(); await persist(); console.log('No active Pi-dependent repositories to maintain.'); return; }
     await mkdir(config.extensionsDir, { recursive: true });
     state.checkouts ||= {};
     const resumedEdits = new Set();
@@ -422,7 +483,8 @@ export async function evergreen(config, deps = {}) {
           await persist();
         }
         if (!tests[repo.name].passed && !selected.includes(repo)) throw new Error('Knowledge regression tests failed');
-        await release(run, repo, config, state.releases, persist, logDir);
+        try { await release(run, repo, config, state.releases, persist, logDir); }
+        catch (error) { if (!error.retired) throw error; retireRepository(state, repo.name, error.message); await persist(); }
       });
     }
     if (repos.some(repo => state.workerReports[repo.name])) throw new Error('Unresolved worker reports remain');

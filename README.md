@@ -1,12 +1,12 @@
 # Pi evergreen
 
-Nightly maintenance for your active GitHub `pi-*` repositories. A Node process runs the workflow at **02:00 in your explicitly configured timezone**, using `node-cron`. A systemd user service keeps the scheduler alive. No system cron entry or systemd timer.
+Nightly maintenance for your active, Pi-dependent GitHub `pi-*` repositories. Evergreen always excludes its own repository. A Node process runs the workflow at **02:00 in your explicitly configured timezone**, using `node-cron`. A systemd user service keeps the scheduler alive. No system cron entry or systemd timer.
 
 ## Workflow
 
 1. Finish interrupted releases before installing a newer Pi runtime.
 2. Try `pi update`. On failure, run `mise upgrade pi` and `mise reshim`. Read back `pi --version`, then run `pi update --extensions`.
-3. Discover the configured owner's active `pi-*` repositories through authenticated, paginated GitHub API calls. Discovery includes private repositories when the owner is the authenticated account. Archived, disabled and deleted repositories are not maintained. Previously cloned inactive repositories stay untouched on disk.
+3. Discover the configured owner's active `pi-*` repositories through authenticated, paginated GitHub API calls. Discovery includes private repositories when the owner is the authenticated account. Archived, disabled and deleted repositories are not maintained. The name prefix is only a candidate filter: a repository must declare a Pi SDK dependency or an explicit Pi resource manifest. Standalone bridges, web apps and other non-Pi projects are skipped before checkout/test/audit work. Pi theme/resource packages remain eligible because they depend on Pi's resource-format contract. Previously cloned inactive repositories stay untouched on disk.
 4. Clone missing repositories and fast-forward existing default branches into `extensionsDir`. Refuse unowned dirty checkouts, unexpected origins, wrong branches and unrelated unpushed commits. Preserve and resume existing edits in checkouts already owned by an unfinished Evergreen job. Never reset user work or force-push.
 5. If Pi's version matches the last completed run and all active repositories have their knowledge and saved test commands, stop after synchronization. Missing first-run metadata or unfinished workers still require work. With no saved version, perform the full first-run audit.
 6. Use the checkouts directly in `PI-EXTENSIONS-DIR`. These are the editable agent checkouts; no second clones or worktrees are created. Run metadata records each checkout's baseline so interrupted agent edits can be resumed in place. Install dependencies without install scripts, override declared Pi SDK dependencies to the target version, verify installed SDK versions, then run tests. Legacy `@mariozechner/pi-*` names and npm aliases map to the current SDK. Missing tests are a failure.
@@ -16,7 +16,7 @@ Nightly maintenance for your active GitHub `pi-*` repositories. A Node process r
 10. Workers fix compatibility, adopt useful public APIs, preserve all existing functionality, and keep tests and knowledge current. Re-test changes, bump the npm patch version, test the release version, commit, push the default branch, then publish to npm only when that package already exists on npm. Unpublished packages stay GitHub-only; Evergreen never creates their initial npm publication. Repositories marked `private: true` keep their existing Git-only distribution and are never made public or sent to npm. An unchanged review gets no empty release. Knowledge is local bookkeeping, not a reason by itself to publish an extension. Changes to its tests or implementation count as real changes.
 11. Record the completed Pi version only after all required work succeeds. Journals resume interrupted pushes and publications without another patch bump. Existing npm versions must match the recorded commit's `gitHead`, or publication recovery fails.
 
-Subagents are independent Pi CLI processes, with configurable concurrency. They do not depend on a particular Pi subagent extension. Extension discovery is disabled for maintenance sessions to avoid recursive delegation and interactive extension dialogs. The main changelog session has no tools. Prompts travel through stdin so a long first-run changelog does not exceed OS argument limits.
+Subagents are independent Pi CLI processes, with configurable concurrency. They do not depend on a particular Pi subagent extension. Extension discovery is disabled for maintenance sessions to avoid recursive delegation and interactive extension dialogs. The main changelog session has no tools. After updating the global Pi installation, Evergreen resolves and pins its existing executable through mise or PATH, rejecting node_modules executables. It never installs a private Pi runtime. Tests and audit agents receive PI_EVERGREEN_PI_BIN; all real Pi/e2e sessions must use that global binary. SDK development packages may still be needed for types and unit checks. Prompts travel through stdin so a long first-run changelog does not exceed OS argument limits.
 
 ## Tests must enforce intent
 
@@ -99,7 +99,7 @@ Paths should be absolute or start with `~`. The hyphenated keys are parsed by do
 
 ## Install on Linux
 
-Requires Node >=22.19, npm, Git, GitHub CLI, `flock`, Pi and mise. mise must provide a working `pi` tool for fallback updates and recovery of unfinished releases that still need tests.
+Requires Node >=22.19, npm, Git, GitHub CLI, `flock`, Pi and mise. mise provides the global-update fallback on this machine. Recovery uses only the existing global Pi; it never installs an older/private runtime. If a prepared release targets a different Pi version, it requires a renewed compatibility audit before publication.
 
 ```sh
 npm ci --ignore-scripts
@@ -169,7 +169,7 @@ The repair supervisor is `scripts/repair.mjs`, a standalone Node program using o
 
 It uses the configured `PI-AGENT-MODEL` and reasoning. It asks an agent to fix real bugs without changing the system's purpose, deleting data, weakening tests, bypassing authentication or changing your model choices. It validates externally rather than trusting the agent's final response. The intended sequence is dependency installation, tests, checks, a full `--once` validation, deployment, a short healthy-service observation, then commit and push. Failures loop with backoff. After a successful push and running-service check, the supervisor exits.
 
-During repair validation, Evergreen's own repository is handled by the supervisor's tests and commit/deployment transaction, not a second extension worker. Other extension repositories still follow the ordinary workflow. This avoids a dirty canonical self-checkout or competing self-release while repair is in progress. Recursive repair triggers are suppressed only inside supervisor validation.
+Evergreen itself is always excluded from ordinary extension maintenance. Its code is maintained by the operator or independent repair supervisor, including the supervisor's tests and commit/deployment transaction. Other extension repositories still follow the ordinary workflow. This avoids a competing self-audit or self-release. Recursive repair triggers are suppressed only inside supervisor validation.
 
 Pre-existing user edits are not automatically swept into a repair commit. The supervisor may take over unfinished Evergreen-owned edits in its own application checkout, using the persisted job identity; unrelated dirty checkouts remain blocked. Repair-created changes and phase information survive retries. `.env`, `.state/`, `tmp/`, credentials and protected instruction files are excluded from repair commits. The supervisor itself is protected from its repair agent's edits.
 
@@ -197,7 +197,7 @@ Both `.state/` and `tmp/` are Git-ignored. Each run cleans run logs older than 1
 
 Agents edit, test, commit and push directly in the extension checkouts. Interrupted changes stay there for the next attempt. Avoid editing these dedicated agent checkouts concurrently with Evergreen.
 
-After a push or publication failure, fix credentials/access and rerun rather than deleting the journal. Pending repositories that disappear, become archived, transfer ownership or change default branch block recovery instead of being published blindly. Inspect and deliberately resolve/cancel such journals. Unexpected package identity or Git changes require inspection of the managed working copy; the runner does not discard them automatically.
+After a push or publication failure, fix credentials/access and rerun rather than deleting the journal. Repositories that disappear, become archived/disabled or cease to depend on Pi are automatically retired. Pending releases and workers are cancelled into retirement history, without publishing or deleting local edits. GitHub status is checked again before release writes, Git push and npm publication. Unexpected default-branch or identity changes still require inspection rather than a blind push. Unexpected package identity or Git changes require inspection of the managed working copy; the runner does not discard them automatically.
 
 Workers and tests execute as your user. Working directories and `--no-approve` are **not a security sandbox**. They can access that user's files and credentials. Use a dedicated maintenance account or container, restricted credentials and trusted repositories. The parent validates publication identity and refuses protected instruction or credential filenames, but cannot prevent every bad model action or malicious test. Autonomous tests and publishing do not guarantee semantic correctness.
 

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile, readFile, cp } from 'node:fs/promises';
 import path from 'node:path';
-import { activeRepos, updatePi, parseVersion, changelogRange, parseAnalysis, discover, syncRepo, testRepo, release, evergreen, usesUndocumentedApis, behavioralReview, registryVersions, assertReleaseFiles, intentTestInstructions, maintenanceRepos } from '../src/evergreen.js';
+import { activeRepos, updatePi, parseVersion, changelogRange, parseAnalysis, discover, syncRepo, testRepo, release, evergreen, usesUndocumentedApis, behavioralReview, registryVersions, assertReleaseFiles, intentTestInstructions, maintenanceRepos, dependsOnPi, eligibleRepos, reconcileRepositories, assertRepositoryActive } from '../src/evergreen.js';
 import { command, config, lock, pool, save, json } from '../src/runtime.js';
 import { readKnowledge, writeKnowledge } from '../src/metadata.js';
 
@@ -131,7 +131,7 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
   const repoDir = path.join(extensionDir, 'pi-test');
   const stateDir = path.join(dir, 'state');
   await mkdir(repoDir, { recursive: true });
-  await save(path.join(repoDir, 'package.json'), { name: 'pi-test-package', private: privatePackage, version: '1.0.0', scripts: { test: 'echo ok' } });
+  await save(path.join(repoDir, 'package.json'), { name: 'pi-test-package', private: privatePackage, version: '1.0.0', pi: { extensions: ['index.js'] }, scripts: { test: 'echo ok' } });
   if (previous) await save(path.join(stateDir, 'state.json'), { version: previous, releases: {} });
   const knowledgePath = path.join(stateDir, 'extensions.md');
   await mkdir(stateDir, { recursive: true });
@@ -156,6 +156,8 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
     if (b === 'gh') {
       if (a[1] === 'user') return '{"login":"gee666"}';
       if (a.includes('--slurp')) return JSON.stringify([[repoData('pi-test')]]);
+      if (a[1]?.includes('/contents/package.json')) return JSON.stringify({content:Buffer.from(JSON.stringify({ pi: { extensions: ['index.js'] } })).toString('base64')});
+      if (a[1] === 'repos/gee666/pi-test') return JSON.stringify(repoData('pi-test'));
       return JSON.stringify({ content: Buffer.from(history).toString('base64') });
     }
     if (b === 'git') {
@@ -187,7 +189,7 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
 
 test('unchanged Pi still updates extensions and syncs but skips tests and AI', async t => {
   const f = await workflowFixture(t, { previous: '1.4.0' });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.ok(f.calls.some(x => x.a.includes('--extensions')));
   assert.ok(f.calls.some(x => x.a.includes('--ff-only')));
   assert.ok(!f.calls.some(x => x.b === 'bash' || x.a.includes('--print')));
@@ -195,7 +197,7 @@ test('unchanged Pi still updates extensions and syncs but skips tests and AI', a
 
 test('first run audits existing knowledge and intent coverage before recording baseline', async t => {
   const f = await workflowFixture(t);
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.equal((await json(f.stateFile)).version, '1.4.0');
   assert.equal(f.calls.filter(x => x.a.includes('--print')).length, 2);
   assert.ok(f.calls.some(x => x.opts.input?.includes('FIRST-RUN TEST AUDIT')));
@@ -204,7 +206,7 @@ test('first run audits existing knowledge and intent coverage before recording b
 
 test('breaking changes launch worker, retest, bump, commit, push then publish', async t => {
   const f = await workflowFixture(t, { changed: true, previous: '1.3.0' });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   const actions = f.calls.map(x => x.a[0]);
   assert.equal(f.calls.filter(x => x.a.includes('--print')).length, 2);
   assert.ok(actions.indexOf('commit') < actions.indexOf('push'));
@@ -214,17 +216,17 @@ test('breaking changes launch worker, retest, bump, commit, push then publish', 
 
 test('failed initial tests trigger worker even for bugfix-only changelog', async t => {
   const f = await workflowFixture(t, { failTests: true, previous: '1.3.0' });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.equal(f.calls.filter(x => x.a.includes('--print')).length, 2);
   assert.equal((await json(f.stateFile)).version, '1.4.0');
 });
 
 test('publish failure preserves baseline and resumes without a second bump or worker', async t => {
   const f = await workflowFixture(t, { changed: true, previous: '1.3.0', failPublish: true });
-  await assert.rejects(evergreen(f.c, { run: f.run }), /registry unavailable/);
+  await assert.rejects(evergreen(f.c, { resolvePi: async () => 'pi', run: f.run }), /registry unavailable/);
   assert.equal((await json(f.stateFile)).version, '1.3.0');
   assert.equal((await json(f.stateFile)).releases['pi-test'].phase, 'publish');
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.equal(f.calls.filter(x => x.b === 'npm' && x.a[0] === 'version').length, 1);
   assert.equal(f.calls.filter(x => x.a.includes('--print')).length, 2);
   assert.equal((await json(f.stateFile)).version, '1.4.0');
@@ -248,14 +250,14 @@ test('dirty checkout aborts before pull', async t => {
 
 test('unrelated changes skip passing extensions even when global breaking flag is true', async t => {
   const f = await workflowFixture(t, { changed: true, relevant: false, previous: '1.3.0' });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.equal(f.calls.filter(x => x.a.includes('--print')).length, 1);
   assert.ok(!f.calls.some(x => x.a[0] === 'publish'));
 });
 
 test('first-run worker creates knowledge and tests before focused changelog analysis', async t => {
   const f = await workflowFixture(t, { knowledge: false, previous: '1.3.0' });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   const sessions = f.calls.filter(x => x.a.includes('--print'));
   assert.equal(sessions.length, 2);
   assert.match(sessions[0].opts.input, /first-run compatibility knowledge subagent/);
@@ -310,26 +312,26 @@ test('failed workers retain edits in the dedicated checkout and resume them in p
     }
     return f.run(bin, args, opts);
   };
-  await assert.rejects(evergreen(f.c, { run: failing }), /worker interrupted/);
+  await assert.rejects(evergreen(f.c, { resolvePi: async () => 'pi', run: failing }), /worker interrupted/);
   assert.equal((await json(f.stateFile)).version, '1.3.0');
   const state = await json(f.stateFile);
   assert.equal(await readFile(path.join(state.checkouts['pi-test'].dir, 'worker-edit.txt'), 'utf8'), 'unfinished fix');
   assert.equal(state.checkouts['pi-test'].dir, f.sourceDir);
   assert.equal(await readFile(path.join(f.sourceDir, 'worker-edit.txt'), 'utf8'), 'unfinished fix');
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.equal((await json(f.stateFile)).version, '1.4.0');
 });
 
 test('pending publications resume before attempting to install a newer Pi', async t => {
   const f = await workflowFixture(t, { changed: true, previous: '1.3.0', failPublish: true });
-  await assert.rejects(evergreen(f.c, { run: f.run }), /registry unavailable/);
+  await assert.rejects(evergreen(f.c, { resolvePi: async () => 'pi', run: f.run }), /registry unavailable/);
   f.calls.length = 0;
   const newerRun = async (bin, args, opts) => {
     if (bin === 'pi' && args[0] === 'update') throw Error('stop at update after recovery');
     if (bin === 'mise') throw Error('new Pi temporarily unavailable');
     return f.run(bin, args, opts);
   };
-  await assert.rejects(evergreen(f.c, { run: newerRun }), /new Pi temporarily unavailable/);
+  await assert.rejects(evergreen(f.c, { resolvePi: async () => 'pi', run: newerRun }), /new Pi temporarily unavailable/);
   assert.equal((await json(f.stateFile)).releases['pi-test'].phase, 'done');
   assert.ok(f.calls.some(x => x.a[0] === 'publish'));
 });
@@ -405,7 +407,7 @@ test('missing or invalid env settings fail instead of inventing defaults', async
 test('internal dependencies alone do not select an unrelated passing extension', async t => {
   const f = await workflowFixture(t, { changed: true, relevant: false, previous: '1.3.0' });
   await writeKnowledge(f.knowledgePath, { 'pi-test': '<!-- pi-evergreen: {"usesUndocumentedApis": true} -->\n# Compatibility\nSSH tool-routing internals. Scrollbar changes are unrelated.' });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.equal(f.calls.filter(c => c.a.includes('--print')).length, 1);
   assert.ok(!f.calls.some(c => c.a[0] === 'publish'));
 });
@@ -420,7 +422,7 @@ test('committed env example contains every required key but no default values', 
 
 test('new repositories receive first-run knowledge and env mapping even when Pi is unchanged', async t => {
   const f = await workflowFixture(t, { previous: '1.4.0', knowledge: false });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.ok(f.calls.some(c => c.opts.input?.includes('first-run compatibility knowledge subagent')));
   assert.match((await readKnowledge(f.knowledgePath))['pi-test'], /Tools matter/);
   assert.deepEqual((await config(f.c.envFile)).testCommands['pi-test'], ['npm test']);
@@ -433,12 +435,12 @@ test('malformed worker report must be repaired on retry, even when its edited te
     if (bin === 'pi' && args.includes('--print') && !args.includes('--no-tools')) return 'not a JSON report';
     return result;
   };
-  await assert.rejects(evergreen(f.c, { run: invalidReport }));
+  await assert.rejects(evergreen(f.c, { resolvePi: async () => 'pi', run: invalidReport }));
   assert.ok((await json(f.stateFile)).workerReports['pi-test']);
   assert.equal((await json(f.stateFile)).version, '1.3.0');
   assert.ok(!f.calls.some(c => c.a[0] === 'publish'));
   assert.match((await readKnowledge(f.knowledgePath))['pi-test'], /Tool execution hooks/);
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   const workers = f.calls.filter(c => c.b === 'pi' && c.a.includes('--print') && !c.a.includes('--no-tools'));
   assert.equal(workers.length, 2);
   assert.equal((await json(f.stateFile)).workerReports['pi-test'], undefined);
@@ -449,7 +451,7 @@ test('malformed worker report must be repaired on retry, even when its edited te
 test('self-repair leaves the app to its supervisor without bypassing other extension checks', () => {
   const repos = [{ name: 'pi-evergreen' }, { name: 'pi-ssh' }];
   const c = { appDir: '/extensions/pi-evergreen', extensionsDir: '/extensions' };
-  assert.deepEqual(maintenanceRepos(repos, c, false), repos);
+  assert.deepEqual(maintenanceRepos(repos, c, false), [{ name: 'pi-ssh' }]);
   assert.deepEqual(maintenanceRepos(repos, c, true), [{ name: 'pi-ssh' }]);
 });
 
@@ -458,7 +460,7 @@ test('inactive repository knowledge is retained but omitted from active changelo
   const notes = await readKnowledge(f.knowledgePath);
   notes['pi-archived'] = 'Retired-extension-sentinel';
   await writeKnowledge(f.knowledgePath, notes);
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   const assessment = f.calls.find(c => c.b === 'pi' && c.a.includes('--no-tools'));
   assert.doesNotMatch(assessment.opts.input, /Retired-extension-sentinel/);
   assert.equal((await readKnowledge(f.knowledgePath))['pi-archived'], 'Retired-extension-sentinel');
@@ -467,7 +469,7 @@ test('inactive repository knowledge is retained but omitted from active changelo
 
 test('private packages retain git-only releases without npm publication or registry checks', async t => {
   const f = await workflowFixture(t, { previous: '1.3.0', changed: true, privatePackage: true });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.ok(f.calls.some(c => c.b === 'git' && c.a[0] === 'commit'));
   assert.ok(f.calls.some(c => c.b === 'git' && c.a[0] === 'push'));
   assert.ok(!f.calls.some(c => c.b === 'npm' && ['publish', 'view', 'whoami'].includes(c.a[0])));
@@ -485,7 +487,7 @@ test('release refuses an unexpected private-to-public policy change', async t =>
 
 test('unpublished npm packages receive GitHub releases only, never an initial npm publication', async t => {
   const f = await workflowFixture(t, { previous: '1.3.0', changed: true, published: false });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.ok(f.calls.some(c => c.b === 'git' && c.a[0] === 'push'));
   assert.ok(!f.calls.some(c => c.b === 'npm' && c.a[0] === 'publish'));
   assert.equal((await json(f.stateFile)).releases['pi-test'].publish, false);
@@ -495,9 +497,46 @@ test('unpublished npm packages receive GitHub releases only, never an initial np
 
 test('agents edit the original extension checkout directly without making a second clone', async t => {
   const f = await workflowFixture(t, { previous: '1.3.0', changed: true });
-  await evergreen(f.c, { run: f.run });
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
   assert.ok(!f.calls.some(c => c.b === 'git' && c.a[0] === 'clone'));
   for (const c of f.calls.filter(c => c.b === 'pi' && c.a.includes('--print') && !c.a.includes('--no-tools'))) assert.equal(c.opts.cwd, f.sourceDir);
   assert.equal((await json(f.stateFile)).checkouts['pi-test'].dir, f.sourceDir);
   await assert.rejects(readFile(path.join(f.c.stateDir, 'workspaces')), { code: 'ENOENT' });
+});
+
+
+test('eligibility requires an actual Pi dependency or explicit Pi resource contract', () => {
+  assert.equal(Boolean(dependsOnPi({ name: 'pi-browser-bridge' })), false);
+  assert.equal(Boolean(dependsOnPi({ scripts: { 'test:pi': 'install optional validation tools' } })), false);
+  assert.equal(Boolean(dependsOnPi({ peerDependencies: { '@earendil-works/pi-coding-agent': '*' } })), true);
+  assert.equal(Boolean(dependsOnPi({ devDependencies: { alias: 'npm:@mariozechner/pi-tui@1.0.0' } })), true);
+  assert.equal(Boolean(dependsOnPi({ pi: { themes: ['theme.json'] } })), true);
+});
+
+test('archived/deleted or unsupported repositories retire pending work without deleting checkouts', () => {
+  const state = { checkouts: { 'pi-old': { dir: '/extensions/pi-old' } }, releases: { 'pi-old': { phase: 'publish' } }, workerReports: { 'pi-old': { phase: 'knowledge' } }, coverageAudits: { 'pi-old': {} } };
+  reconcileRepositories(state, []);
+  assert.equal(state.releases['pi-old'], undefined);
+  assert.equal(state.workerReports['pi-old'], undefined);
+  assert.equal(state.retired['pi-old'].release.phase, 'publish');
+  assert.equal(state.checkouts['pi-old'].dir, '/extensions/pi-old');
+});
+
+test('release checks detect archival and deletion while authentication failures remain errors', async () => {
+  const repo = { owner: 'gee666', name: 'pi-old' };
+  await assert.rejects(assertRepositoryActive(async () => JSON.stringify({ ...repoData('pi-old'), archived: true }), repo), e => e.retired === true);
+  await assert.rejects(assertRepositoryActive(async () => { throw Error('HTTP 404'); }, repo), e => e.retired === true);
+  await assert.rejects(assertRepositoryActive(async () => { throw Error('HTTP 401'); }, repo), /HTTP 401/);
+});
+
+
+test('a prepared release uses only the existing global Pi, never installs an older runtime', async t => {
+  const f = await workflowFixture(t, { previous: '1.3.0' });
+  const state = await json(f.stateFile);
+  state.targetVersion = '1.4.0';
+  state.releases = { 'pi-test': { phase: 'prepare', version: '1.0.1', oldVersion: '1.0.0', package: 'pi-test-package', publish: true, base: 'base', piVersion: '1.4.0', repo: { name: 'pi-test', owner: 'gee666', branch: 'master', dir: f.sourceDir } } };
+  await save(f.stateFile, state);
+  await evergreen(f.c, { resolvePi: async () => 'pi', run: f.run });
+  assert.ok(!f.calls.some(c => c.b === 'mise' && ['install', 'exec'].includes(c.a[0])));
+  assert.equal((await json(f.stateFile)).releases['pi-test'].phase, 'done');
 });

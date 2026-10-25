@@ -10,7 +10,7 @@
     "start": "node src/cli.js",
     "once": "node src/cli.js --once",
     "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/evergreen.js && node --check src/runtime.js && node --check src/metadata.js && node --check src/cleanup.js && node --check src/repair-trigger.js && node --check scripts/repair.mjs && node --check src/npm-auth.js"
+    "check": "node --check src/cli.js && node --check src/evergreen.js && node --check src/runtime.js && node --check src/metadata.js && node --check src/cleanup.js && node --check src/repair-trigger.js && node --check scripts/repair.mjs && node --check src/npm-auth.js && node --check src/pi-runtime.js"
   },
   "dependencies": {
     "dotenv": "^18.0.9",
