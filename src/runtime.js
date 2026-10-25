@@ -51,6 +51,7 @@ export async function config(file = fileURLToPath(new URL('../.env', import.meta
     agentTimeoutMs: Number(values['PI-AGENT-TIMEOUT-MS']),
     publishAccess: values['PI-PUBLISH-ACCESS'],
     testCommands: readTestCommands(values),
+    npmTokenConfigured: Boolean(values.NPM_TOKEN?.trim()),
   };
   if (!/^[\w.-]+$/.test(result.owner)) throw new Error('PI-GITHUB-OWNER is invalid');
   if (!Number.isInteger(result.concurrency) || result.concurrency < 1 || result.concurrency > 8) throw new Error('PI-CONCURRENCY must be 1..8');
@@ -70,6 +71,8 @@ export function command(bin, args = [], { cwd, timeout = 20 * 60_000, input, log
       env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0', CI: '1' },
     });
     let stdout = '', stderr = '', failure;
+    const secrets = [...new Set([env.NPM_TOKEN, process.env.NPM_TOKEN].filter(value => typeof value === 'string' && value))];
+    const redact = text => secrets.reduce((safe, secret) => safe.split(secret).join('[REDACTED]'), text);
     const max = 8 * 1024 * 1024;
     const kill = () => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} };
     const terminate = () => { kill(); child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); };
@@ -88,10 +91,10 @@ export function command(bin, args = [], { cwd, timeout = 20 * 60_000, input, log
       clearTimeout(timer);
       process.removeListener('exit', kill);
       try {
-        if (logFile) await writeFile(logFile, stdout + '\n' + stderr, { mode: 0o600 });
+        if (logFile) await writeFile(logFile, redact(stdout + '\n' + stderr), { mode: 0o600 });
         if (failure) throw failure;
-        if (code !== 0) throw new Error(`${bin} ${args.slice(0, 3).join(' ')} exited ${code}\n${stderr.slice(-4000)}\n${stdout.slice(-4000)}`);
-        resolve(stdout.trim());
+        if (code !== 0) throw new Error(`${bin} ${args.slice(0, 3).join(' ')} exited ${code}\n${redact(stderr).slice(-4000)}\n${redact(stdout).slice(-4000)}`);
+        resolve(redact(stdout).trim());
       } catch (e) { reject(e); }
     });
   });

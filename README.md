@@ -67,6 +67,22 @@ PI-AGENT-MODEL=openai/gpt-6.1-sol/medium
 PI-E2E-MODEL=openai/gpt-6-luna/low
 ```
 
+### npm credential
+
+Set `NPM_TOKEN` in the ignored application `.env`. Evergreen reads it for each run, and the independent repair supervisor reloads it on each retry. Token rotation does not require modifying application code or logging in through npm. The template contains only an empty placeholder.
+
+Both processes create a private temporary npm user configuration referencing the token through a child-process environment variable. The literal token is not written into the generated npmrc or printed by `--check-config`. Existing user npm configuration is preserved, and the temporary configuration is removed when the run/attempt ends. The main runner redacts the active token from captured output and logs. Use a token with the necessary package publishing permissions and unattended 2FA policy.
+
+`.env` must have mode 0600. Never commit it or paste its contents into chat. Node processes and repository tests inherit the credential, so this still requires trusted repositories and a trusted maintenance account.
+
+Check the exact authentication path used by the application without running maintenance or publishing:
+
+```sh
+node src/cli.js --check-auth
+```
+
+This checks authenticated GitHub account, npm identity, both Pi model credentials, and a dry-run Git push. Diagnostics never launch the repair service on failure.
+
 Choose the provider that actually provides the model and has credentials on this machine. Reasoning is mandatory: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Maintenance invocations pass it explicitly through `--thinking`; generated e2e tests must do the same using their separate selection. Pi may clamp unsupported reasoning levels to a model's capabilities.
 
 There is no manual test-command mapping setting. During the first run, each extension agent discovers, adds and runs its full test suites, then reports the commands to the parent. Evergreen appends an automatic entry for that repository, such as:
@@ -98,7 +114,7 @@ Authenticate independently on this machine:
 gh auth login
 # Configure Git credentials only if Git pushes do not already work.
 gh auth setup-git
-npm login
+# Set NPM_TOKEN in the application .env.
 pi auth check --provider YOUR_PROVIDER --model YOUR_MODEL
 pi auth check --provider YOUR_E2E_PROVIDER --model YOUR_E2E_MODEL
 ```
