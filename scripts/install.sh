@@ -14,9 +14,9 @@ Description=Keep Pi extensions evergreen
 
 [Service]
 Type=oneshot
-WorkingDirectory="$project"
+WorkingDirectory=$project
 Environment="PATH=$HOME/.local/share/mise/shims:$PATH"
-ExecStart=node --env-file=.env src/run.ts
+ExecStart=/usr/bin/env node --env-file=.env src/run.ts
 TimeoutStartSec=infinity
 UNIT
 
