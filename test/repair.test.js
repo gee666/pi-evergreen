@@ -442,3 +442,13 @@ test('repair waits for a running maintenance job before attempting validation or
   assert.equal(calls(f, 'pi', '--print').length, 0);
   assert.equal(calls(f, 'node').length, 0);
 });
+
+
+test('complete maintenance validation has enough budget for the bounded extension audit jobs', async t => {
+  const f = await fixture(t);
+  const s = await f.make();
+  assert.equal(await s.cycle(), true);
+  const full = calls(f, 'node').find(e => e.args.includes('--once'));
+  assert.equal(full.opts.timeout, 24 * 60 * 60_000);
+  assert.equal(calls(f, 'npm', 'test')[0].opts.timeout, 60 * 60_000);
+});

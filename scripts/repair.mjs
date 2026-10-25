@@ -350,7 +350,9 @@ export async function createSupervisor({ root, run = command, sleep = (ms, signa
         state.next = 'repair'; failurePhase = 'validation';
         for (const [bin, args] of [['npm', ['ci', '--ignore-scripts']], ['npm', ['test']], ['npm', ['run', 'check']],
           ['node', ['src/cli.js', '--once']]]) {
-          await ownedCommand('validation', bin, args, { timeout: 60 * 60_000, maxOutput: 2 * 1024 * 1024 });
+          // The first maintenance run includes many bounded 90-minute audit jobs.
+          const timeout = bin === 'node' ? 24 * 60 * 60_000 : 60 * 60_000;
+          await ownedCommand('validation', bin, args, { timeout, maxOutput: 2 * 1024 * 1024 });
         }
         failurePhase = 'deployment'; await requirePackage();
         await ownedCommand('deployment', 'bash', ['scripts/install-service.sh', '--deploy-from-repair'], { timeout: 10 * 60_000 });
