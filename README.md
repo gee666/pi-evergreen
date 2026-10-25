@@ -9,6 +9,12 @@ changes or monthly dependencies are due. One master agent selects work and
 launches one worker per affected extension. Workers test, commit, patch, push,
 and publish packages that are public and already on npm.
 
+Before the master starts, Evergreen installs `maintainer` and `test-summarizer`
+agent cards in `<extensionsDir>/.pi/agents/`, appending the shared `rules.md` to
+each. The master selects the worker preset for maintainers and the junior preset
+for test summaries. Project agents need no interactive confirmation. First-run
+initialization remains a separate Pi process per new repo.
+
 ## Configure
 
 Requires Node 26, npm, mise-managed Pi, git, gh with GitHub access, and the

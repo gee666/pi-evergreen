@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { modelPreset, promptsDir, type Config } from './config.ts';
+import { agentsDir, modelPreset, promptsDir, type Config } from './config.ts';
 import { command, readOptional } from './io.ts';
 import type { Repo } from './repos.ts';
 
@@ -39,7 +39,7 @@ export async function firstRuns(repos: Repo[], config: Config, runDir: string,
     const log = join(runDir, `first-run-${repo.name}.log`);
     console.log(`Initializing ${repo.name}, log: ${log}`);
     const text = await prompt('first-run', {
-      repoPath: repo.path, workerPrompt: join(promptsDir, 'worker.md'),
+      repoPath: repo.path, workerPrompt: join(agentsDir, 'maintainer.md'),
       pullFailures: pullFailures.join('\n') || 'None',
     });
     const code = await spawnAgent(repo.path, text, config, env, log);
@@ -53,22 +53,32 @@ export async function firstRuns(repos: Repo[], config: Config, runDir: string,
   return initialized.filter((repo) => repo !== undefined);
 }
 
-export async function masterAgent(config: Config, runDir: string, env: NodeJS.ProcessEnv,
-  values: Record<string, string>): Promise<number> {
-  console.log('Writing subagent presets and launching the master agent');
+export async function installAgentCards(config: Config): Promise<void> {
   const piDir = join(config.extensionsDir, '.pi');
-  await mkdir(piDir, { recursive: true });
+  const cardsDir = join(piDir, 'agents');
+  await mkdir(cardsDir, { recursive: true });
+  const rules = await readFile(join(promptsDir, 'rules.md'), 'utf8');
+  for (const name of ['maintainer', 'test-summarizer']) {
+    const card = await readFile(join(agentsDir, `${name}.md`), 'utf8');
+    await writeFile(join(cardsDir, `${name}.md`), `${card}\n${rules}`);
+  }
   await writeFile(join(piDir, 'pi-subagent.json'), JSON.stringify({
     'subagents-models': [
       { junior: modelPreset(config.juniorModel) },
       { worker: modelPreset(config.model) },
     ],
+    agents: { confirmProject: 'never' },
     limits: { total: 1000, tasksPerCall: 100, concurrency: 100 },
     runner: { idleTimeoutMs: 0 },
   }, null, 2) + '\n');
+}
+
+export async function masterAgent(config: Config, runDir: string, env: NodeJS.ProcessEnv,
+  values: Record<string, string>): Promise<number> {
+  console.log('Installing subagent cards and presets, then launching the master agent');
+  await installAgentCards(config);
   const text = await prompt('master', {
-    ...values, runDir, workerPrompt: join(promptsDir, 'worker.md'),
-    rulesPath: join(promptsDir, 'rules.md'), reportPath: join(runDir, 'report.md'),
+    ...values, runDir, reportPath: join(runDir, 'report.md'),
   });
   return spawnAgent(config.extensionsDir, text, config, env, join(runDir, 'master.log'));
 }

@@ -1,6 +1,7 @@
 import { fileURLToPath } from 'node:url';
 
 export const projectDir = fileURLToPath(new URL('../', import.meta.url));
+export const agentsDir = fileURLToPath(new URL('../agents/', import.meta.url));
 export const promptsDir = fileURLToPath(new URL('../prompts/', import.meta.url));
 
 export function loadConfig() {
