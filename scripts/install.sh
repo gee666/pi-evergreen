@@ -36,5 +36,5 @@ cd "$project"
 npm ci
 loginctl enable-linger "$USER"
 systemctl --user daemon-reload
-systemctl --user enable pi-evergreen.timer
+systemctl --user enable --now pi-evergreen.timer
 printf 'Timer enabled. Service was not started by this installer.\n'
