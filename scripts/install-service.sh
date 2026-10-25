@@ -28,6 +28,7 @@ WorkingDirectory=$root
 Environment="PATH=$PATH"
 ExecStart=/usr/bin/env node "$root/src/cli.js"
 Restart=no
+SuccessExitStatus=130 143
 KillMode=control-group
 TimeoutStopSec=20
 UMask=0077

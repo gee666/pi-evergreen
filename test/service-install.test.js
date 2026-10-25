@@ -23,6 +23,7 @@ test('installer deploys both units without a restart loop or stopping its repair
     const calls = await readFile(log, 'utf8');
     assert.match(app, /OnFailure=pi-evergreen-repair\.service/);
     assert.match(app, /Restart=no/);
+    assert.match(app, /SuccessExitStatus=130 143/);
     assert.match(repair, /ExecStart=.*scripts\/repair\.mjs/);
     assert.match(repair, /Restart=on-failure/);
     assert.match(repair, /Environment=PI_EVERGREEN_REPAIR_ACTIVE=1/);

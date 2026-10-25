@@ -6,8 +6,8 @@ import { evergreen } from './evergreen.js';
 import { requestRepair } from './repair-trigger.js';
 import { prepareNpmAuth } from './npm-auth.js';
 
-process.once('SIGTERM', () => process.exit(143));
-process.once('SIGINT', () => process.exit(130));
+process.once('SIGTERM', () => process.exit(0));
+process.once('SIGINT', () => process.exit(0));
 
 try {
   if (process.argv.slice(2).some(a => !['--once', '--check-config', '--check-auth'].includes(a))) throw new Error('Usage: node src/cli.js [--once | --check-config | --check-auth]');
