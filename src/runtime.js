@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parse } from 'dotenv';
 
 export const expand = (p) => path.resolve(p.replace(/^~(?=\/|$)/, homedir()));
 export async function json(file, fallback) {
@@ -15,42 +17,57 @@ export async function save(file, value) {
   await rename(temp, file);
 }
 
-export async function config(env = process.env) {
-  const agentDir = expand(env.PI_CODING_AGENT_DIR || '~/.pi/agent');
-  const settings = await json(path.join(agentDir, 'settings.json'), {});
-  const file = expand(env.PI_EVERGREEN_CONFIG || '~/.config/pi-evergreen/settings.json');
-  const local = await json(file, {});
-  const s = { ...settings.evergreen, ...local };
-  const dir = env['PI-EXTENSIONS-DIR'] || env.PI_EXTENSIONS_DIR || s['PI-EXTENSIONS-DIR'] || s.extensionsDir || settings['PI-EXTENSIONS-DIR'];
-  if (!dir) throw new Error('Set PI_EXTENSIONS_DIR or extensionsDir in ' + file);
+export function modelSpec(value, key) {
+  const parts = value.split('/');
+  const provider = parts.shift();
+  const reasoning = parts.pop();
+  const model = parts.join('/');
+  if (!provider || !model || /\s/.test(value) || !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(reasoning)) throw new Error(`${key} must be provider/model/reasoning-level with an explicit valid reasoning level`);
+  return { provider, model, reasoning };
+}
+
+export async function config(file = fileURLToPath(new URL('../.env', import.meta.url))) {
+  let values;
+  try { values = parse(await readFile(file, 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') throw new Error(`Missing Evergreen env file: ${file}. Fill in the blank .env.example template and save it as .env.`);
+    throw error;
+  }
+  const keys = ['PI-EXTENSIONS-DIR', 'PI-STATE-DIR', 'PI-GITHUB-OWNER', 'PI-AGENT-MODEL', 'PI-E2E-MODEL', 'PI-TIMEZONE', 'PI-CONCURRENCY', 'PI-COMMAND-TIMEOUT-MS', 'PI-AGENT-TIMEOUT-MS', 'PI-PUBLISH-ACCESS'];
+  const missing = keys.filter(key => !values[key]?.trim());
+  if (missing.length) throw new Error(`Missing required Evergreen settings in ${file}: ${missing.join(', ')}`);
+  const agent = modelSpec(values['PI-AGENT-MODEL'], 'PI-AGENT-MODEL');
+  const e2e = modelSpec(values['PI-E2E-MODEL'], 'PI-E2E-MODEL');
   const result = {
-    extensionsDir: expand(dir),
-    stateDir: expand(env.PI_EVERGREEN_STATE_DIR || s.stateDir || '~/.local/state/pi-evergreen'),
-    owner: env.PI_EVERGREEN_GITHUB_OWNER || s.githubOwner,
-    provider: env.PI_EVERGREEN_PROVIDER || env.PI_PROVIDER || s.provider || settings.defaultProvider,
-    model: env.PI_EVERGREEN_MODEL || env.PI_MODEL || s.model || settings.defaultModel,
-    timezone: env.TZ || s.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
-    concurrency: Number(env.PI_EVERGREEN_CONCURRENCY || s.concurrency || 2),
-    commandTimeoutMs: s.commandTimeoutMs ?? 20 * 60_000,
-    agentTimeoutMs: s.agentTimeoutMs ?? 90 * 60_000,
-    testCommands: s.testCommands || {},
-    publishAccess: s.publishAccess || 'public',
+    extensionsDir: expand(values['PI-EXTENSIONS-DIR']),
+    stateDir: expand(values['PI-STATE-DIR']),
+    owner: values['PI-GITHUB-OWNER'],
+    provider: agent.provider, model: agent.model, reasoning: agent.reasoning,
+    e2eProvider: e2e.provider, e2eModel: e2e.model, e2eReasoning: e2e.reasoning,
+    timezone: values['PI-TIMEZONE'],
+    concurrency: Number(values['PI-CONCURRENCY']),
+    commandTimeoutMs: Number(values['PI-COMMAND-TIMEOUT-MS']),
+    agentTimeoutMs: Number(values['PI-AGENT-TIMEOUT-MS']),
+    publishAccess: values['PI-PUBLISH-ACCESS'],
+    testCommands: values['PI-TEST-COMMANDS']?.trim() ? JSON.parse(values['PI-TEST-COMMANDS']) : undefined,
   };
-  if (!result.provider || !result.model) throw new Error('Configure provider and model in Pi settings or evergreen settings/env');
-  if (!Number.isInteger(result.concurrency) || result.concurrency < 1 || result.concurrency > 8) throw new Error('concurrency must be 1..8');
+  if (!/^[\w.-]+$/.test(result.owner)) throw new Error('PI-GITHUB-OWNER is invalid');
+  if (!Number.isInteger(result.concurrency) || result.concurrency < 1 || result.concurrency > 8) throw new Error('PI-CONCURRENCY must be 1..8');
   for (const key of ['commandTimeoutMs', 'agentTimeoutMs']) {
     if (!Number.isSafeInteger(result[key]) || result[key] < 1000) throw new Error(`${key} must be an integer >= 1000`);
   }
+  if (!['public', 'restricted'].includes(result.publishAccess)) throw new Error('PI-PUBLISH-ACCESS must be public or restricted');
+  if (result.testCommands !== undefined && (!result.testCommands || typeof result.testCommands !== 'object' || Array.isArray(result.testCommands))) throw new Error('PI-TEST-COMMANDS must be a JSON object');
   new Intl.DateTimeFormat('en', { timeZone: result.timezone });
   return result;
 }
 
 // Deadlines kill the child's process group. The systemd service also contains descendants.
-export function command(bin, args = [], { cwd, timeout = 20 * 60_000, input, logFile } = {}) {
+export function command(bin, args = [], { cwd, timeout = 20 * 60_000, input, logFile, env = {} } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
       cwd, detached: true, stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', CI: '1' },
+      env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: '0', CI: '1' },
     });
     let stdout = '', stderr = '', failure;
     const max = 8 * 1024 * 1024;

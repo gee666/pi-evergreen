@@ -13,6 +13,7 @@
     "check": "node --check src/cli.js && node --check src/evergreen.js && node --check src/runtime.js"
   },
   "dependencies": {
+    "dotenv": "^18.0.9",
     "node-cron": "^4.2.1",
     "semver": "^7.7.3"
   },
@@ -22,7 +23,7 @@
   "files": [
     "src/",
     "scripts/",
-    "settings.example.json",
+    ".env.example",
     "README.md",
     "LICENSE"
   ],

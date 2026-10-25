@@ -2,10 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile, readFile, cp } from 'node:fs/promises';
 import path from 'node:path';
-import { activeRepos, updatePi, parseVersion, changelogRange, parseAnalysis, discover, syncRepo, testRepo, release, evergreen, usesUndocumentedApis, behavioralReview, registryVersions, assertReleaseFiles } from '../src/evergreen.js';
+import { activeRepos, updatePi, parseVersion, changelogRange, parseAnalysis, discover, syncRepo, testRepo, release, evergreen, usesUndocumentedApis, behavioralReview, registryVersions, assertReleaseFiles, intentTestInstructions } from '../src/evergreen.js';
 import { command, config, lock, pool, save, json } from '../src/runtime.js';
 
 const root = path.resolve('tmp/tests');
+const explicitEnv = dir => ({ 'PI-EXTENSIONS-DIR': dir, 'PI-STATE-DIR': path.join(dir, 'state'), 'PI-GITHUB-OWNER': 'gee666', 'PI-AGENT-MODEL': 'openai-codex/gpt-6.1-sol/medium', 'PI-E2E-MODEL': 'openai-codex/gpt-6-luna/low', 'PI-TIMEZONE': 'UTC', 'PI-CONCURRENCY': '2', 'PI-COMMAND-TIMEOUT-MS': '1200000', 'PI-AGENT-TIMEOUT-MS': '5400000', 'PI-PUBLISH-ACCESS': 'public' });
+const writeEnv = (file, values) => writeFile(file, Object.entries(values).map(([key, value]) => `${key}='${value}'`).join('\n'));
+
 async function fixture(t) {
   await mkdir(root, { recursive: true });
   const dir = await mkdtemp(path.join(root, 'run-'));
@@ -65,13 +68,17 @@ test('changelog excludes previous version and refuses gaps', () => {
   assert.throws(() => changelogRange(history, '0.9.0', '1.4.0'), /full version range/);
 });
 
-test('config reads settings model and env path, with explicit env priority', async t => {
+test('config reads only the application env file with explicit model reasoning', async t => {
   const dir = await fixture(t);
-  await save(path.join(dir, 'settings.json'), { defaultProvider: 'openai-codex', defaultModel: 'gpt-6.1-sol', evergreen: { extensionsDir: dir } });
-  const c = await config({ PI_CODING_AGENT_DIR: dir, PI_EVERGREEN_CONFIG: path.join(dir, 'absent.json'), 'PI-EXTENSIONS-DIR': path.join(dir, 'extensions'), PI_MODEL: 'other' });
+  const file = path.join(dir, '.env');
+  await writeEnv(file, explicitEnv(dir));
+  await save(path.join(dir, 'settings.json'), { defaultProvider: 'wrong', defaultModel: 'wrong' });
+  const c = await config(file);
   assert.equal(c.provider, 'openai-codex');
-  assert.equal(c.model, 'other');
-  assert.equal(c.extensionsDir, path.join(dir, 'extensions'));
+  assert.equal(c.model, 'gpt-6.1-sol');
+  assert.equal(c.reasoning, 'medium');
+  assert.equal(c.e2eReasoning, 'low');
+  assert.equal(c.extensionsDir, dir);
 });
 
 test('exclusive lock rejects overlapping runs and releases', async t => {
@@ -106,7 +113,7 @@ test('tests override SDK to current Pi and missing tests are failures', async t 
   const pkg = { name: 'test', version: '1.0.0', devDependencies: { '@earendil-works/pi-coding-agent': '^1.0.0' }, scripts: { test: 'node --test', check: 'echo check' } };
   await save(path.join(dir, 'package.json'), pkg);
   const calls = [];
-  const c = { piVersion: '1.4.0', testCommands: {} };
+  const c = { piVersion: '1.4.0', testCommands: {}, e2eProvider: 'openai-codex', e2eModel: 'gpt-6-luna' };
   const repo = { dir, name: 'pi-test' };
   assert.equal((await testRepo(async (b, a) => { calls.push([b, ...a]); return ''; }, repo, c, dir, 'initial')).passed, true);
   assert.ok(calls.some(a => a.includes('@earendil-works/pi-coding-agent@1.4.0')));
@@ -167,7 +174,7 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
     }
     throw Error('Unexpected command ' + b);
   };
-  const c = { extensionsDir: extensionDir, stateDir, concurrency: 2, testCommands: {}, provider: 'openai-codex', model: 'gpt-6.1-sol', piVersion: '1.4.0', publishAccess: 'public' };
+  const c = { extensionsDir: extensionDir, stateDir, concurrency: 2, testCommands: {}, provider: 'openai-codex', model: 'gpt-6.1-sol', e2eProvider: 'openai-codex', e2eModel: 'gpt-6-luna', reasoning: 'medium', e2eReasoning: 'low', piVersion: '1.4.0', publishAccess: 'public' };
   return { c, run, calls, sourceDir: repoDir, setPiVersion: v => { piVersion = v; }, stateFile: path.join(stateDir, 'state.json') };
 }
 
@@ -179,12 +186,13 @@ test('unchanged Pi still updates extensions and syncs but skips tests and AI', a
   assert.ok(!f.calls.some(x => x.b === 'bash' || x.a.includes('--print')));
 });
 
-test('first run checks full history and records baseline on bugfix-only release', async t => {
+test('first run audits existing knowledge and intent coverage before recording baseline', async t => {
   const f = await workflowFixture(t);
   await evergreen(f.c, { run: f.run });
   assert.equal((await json(f.stateFile)).version, '1.4.0');
-  assert.equal(f.calls.filter(x => x.a.includes('--print')).length, 1);
-  assert.ok(!f.calls.some(x => x.a[0] === 'publish'));
+  assert.equal(f.calls.filter(x => x.a.includes('--print')).length, 2);
+  assert.ok(f.calls.some(x => x.opts.input?.includes('FIRST-RUN TEST AUDIT')));
+  assert.ok(f.calls.some(x => x.a[0] === 'publish'));
 });
 
 test('breaking changes launch worker, retest, bump, commit, push then publish', async t => {
@@ -324,4 +332,77 @@ test('node-cron schedules 02:00 in the selected timezone', async () => {
     assert.equal(next.getUTCHours(), 2);
     assert.equal(next.getUTCMinutes(), 0);
   } finally { await task.destroy(); }
+});
+
+
+test('e2e model selection is explicit and independent of maintenance', async t => {
+  const dir = await fixture(t);
+  const file = path.join(dir, '.env');
+  const values = explicitEnv(dir);
+  await writeEnv(file, values);
+  const first = await config(file);
+  assert.equal(first.model, 'gpt-6.1-sol');
+  assert.equal(first.e2eModel, 'gpt-6-luna');
+  values['PI-E2E-MODEL'] = 'other/cheap-model/high';
+  await writeEnv(file, values);
+  const changed = await config(file);
+  assert.equal(changed.e2eProvider, 'other');
+  assert.equal(changed.e2eModel, 'cheap-model');
+  assert.equal(changed.e2eReasoning, 'high');
+  assert.equal(changed.model, 'gpt-6.1-sol');
+});
+
+test('test:e2e runs with configured model environment and failures do not silently pass', async t => {
+  const dir = await fixture(t);
+  await save(path.join(dir, 'package.json'), { scripts: { test: 'node --test', 'test:e2e': 'pi-live-test' } });
+  const calls = [];
+  const result = await testRepo(async (bin, args, opts) => {
+    calls.push({ bin, args, opts });
+    if (bin === 'bash' && args.at(-1) === 'npm run test:e2e') throw Error('intent violated');
+    return '';
+  }, { dir, name: 'pi-example' }, { piVersion: '1.4.0', testCommands: { 'pi-example': ['npm test'] }, e2eProvider: 'test-provider', e2eModel: 'cheap-model', e2eReasoning: 'low' }, dir, 'e2e');
+  assert.equal(result.passed, false);
+  const live = calls.find(c => c.bin === 'bash' && c.args.at(-1) === 'npm run test:e2e');
+  assert.equal(live.opts.env.PI_EVERGREEN_E2E_PROVIDER, 'test-provider');
+  assert.equal(live.opts.env.PI_EVERGREEN_E2E_MODEL, 'cheap-model');
+  assert.equal(live.opts.env.PI_EVERGREEN_E2E_REASONING, 'low');
+  assert.equal(live.opts.env.PI_EVERGREEN_E2E, '1');
+  const instructions = intentTestInstructions({ provider: 'maintenance', e2eProvider: 'test-provider', e2eModel: 'cheap-model' }, true);
+  assert.match(instructions, /FIRST-RUN TEST AUDIT/);
+  assert.match(instructions, /actual installed Pi CLI/);
+  assert.match(instructions, /provider-bound/);
+  assert.match(instructions, /negative control/);
+  assert.match(instructions, /test-provider/);
+  assert.match(instructions, /cheap-model/);
+});
+
+
+test('missing or invalid env settings fail instead of inventing defaults', async t => {
+  const dir = await fixture(t);
+  const file = path.join(dir, '.env');
+  await assert.rejects(config(file), /Missing Evergreen env file/);
+  for (const key of ['PI-E2E-MODEL', 'PI-AGENT-MODEL', 'PI-CONCURRENCY', 'PI-STATE-DIR']) {
+    const values = explicitEnv(dir); values[key] = '';
+    await writeEnv(file, values);
+    await assert.rejects(config(file), new RegExp(key));
+  }
+  const values = explicitEnv(dir); values['PI-AGENT-MODEL'] = 'provider/model';
+  await writeEnv(file, values);
+  await assert.rejects(config(file), /reasoning-level/);
+});
+
+test('internal dependencies alone do not select an unrelated passing extension', async t => {
+  const f = await workflowFixture(t, { changed: true, relevant: false, previous: '1.3.0' });
+  await writeFile(path.join(f.sourceDir, 'PI_COMPATIBILITY.md'), '<!-- pi-evergreen: {"usesUndocumentedApis": true} -->\n# Compatibility\nSSH tool-routing internals. Scrollbar changes are unrelated.');
+  await evergreen(f.c, { run: f.run });
+  assert.equal(f.calls.filter(c => c.a.includes('--print')).length, 1);
+  assert.ok(!f.calls.some(c => c.a[0] === 'publish'));
+});
+
+
+test('committed env example contains every required key but no default values', async () => {
+  const { parse } = await import('dotenv');
+  const values = parse(await readFile('.env.example', 'utf8'));
+  for (const key of Object.keys(explicitEnv('/example'))) assert.ok(key in values, key);
+  assert.ok(Object.values(values).every(value => value === ''));
 });

@@ -21,7 +21,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$root
 Environment="PATH=$PATH"
-EnvironmentFile=-%h/.config/pi-evergreen/environment
 ExecStart=/usr/bin/env node "$root/src/cli.js"
 Restart=on-failure
 RestartSec=30
