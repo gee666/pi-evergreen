@@ -163,7 +163,7 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
       if (a.includes('--show-toplevel')) return opts.cwd;
       if (a[0] === 'remote') return 'https://github.com/gee666/pi-test.git';
       if (a[0] === 'branch') return 'master';
-      if (a[0] === 'status') return opts.cwd !== repoDir && dirty ? ' M index.js' : '';
+      if (a[0] === 'status') return dirty ? ' M index.js' : '';
       if (a[0] === 'rev-list') return '0';
       if (a[0] === 'rev-parse') return head;
       if (a[0] === 'commit') { head = 'release-commit'; dirty = false; }
@@ -301,7 +301,7 @@ test('kernel lock ignores stale lockfile contents', async t => {
 });
 
 
-test('failed workers preserve managed edits without dirtying the canonical checkout', async t => {
+test('failed workers retain edits in the dedicated checkout and resume them in place', async t => {
   const f = await workflowFixture(t, { changed: true, previous: '1.3.0' });
   const failing = async (bin, args, opts) => {
     if (bin === 'pi' && args.includes('--print') && !args.includes('--no-tools')) {
@@ -313,8 +313,9 @@ test('failed workers preserve managed edits without dirtying the canonical check
   await assert.rejects(evergreen(f.c, { run: failing }), /worker interrupted/);
   assert.equal((await json(f.stateFile)).version, '1.3.0');
   const state = await json(f.stateFile);
-  assert.equal(await readFile(path.join(state.workspaces['pi-test'].dir, 'worker-edit.txt'), 'utf8'), 'unfinished fix');
-  await assert.rejects(readFile(path.join(f.sourceDir, 'worker-edit.txt')), { code: 'ENOENT' });
+  assert.equal(await readFile(path.join(state.checkouts['pi-test'].dir, 'worker-edit.txt'), 'utf8'), 'unfinished fix');
+  assert.equal(state.checkouts['pi-test'].dir, f.sourceDir);
+  assert.equal(await readFile(path.join(f.sourceDir, 'worker-edit.txt'), 'utf8'), 'unfinished fix');
   await evergreen(f.c, { run: f.run });
   assert.equal((await json(f.stateFile)).version, '1.4.0');
 });
@@ -489,4 +490,14 @@ test('unpublished npm packages receive GitHub releases only, never an initial np
   assert.ok(!f.calls.some(c => c.b === 'npm' && c.a[0] === 'publish'));
   assert.equal((await json(f.stateFile)).releases['pi-test'].publish, false);
   assert.equal((await json(f.stateFile)).releases['pi-test'].phase, 'done');
+});
+
+
+test('agents edit the original extension checkout directly without making a second clone', async t => {
+  const f = await workflowFixture(t, { previous: '1.3.0', changed: true });
+  await evergreen(f.c, { run: f.run });
+  assert.ok(!f.calls.some(c => c.b === 'git' && c.a[0] === 'clone'));
+  for (const c of f.calls.filter(c => c.b === 'pi' && c.a.includes('--print') && !c.a.includes('--no-tools'))) assert.equal(c.opts.cwd, f.sourceDir);
+  assert.equal((await json(f.stateFile)).checkouts['pi-test'].dir, f.sourceDir);
+  await assert.rejects(readFile(path.join(f.c.stateDir, 'workspaces')), { code: 'ENOENT' });
 });

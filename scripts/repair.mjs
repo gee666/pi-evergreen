@@ -128,6 +128,17 @@ Context: ${context}
 README workflow:\n${readme}`;
 }
 
+export function agentOwnsCheckout(root, head, appState) {
+  const entries = Object.entries(appState?.checkouts || {});
+  const entry = entries.find(([, value]) => value.dir === root);
+  if (!entry) return false;
+  const [name, record] = entry;
+  const inProgress = appState.targetVersion !== appState.version || Boolean(appState.workerReports?.[name]);
+  const audited = Boolean(appState.workerReports?.[name] || appState.coverageAudits?.[name]);
+  const expected = appState.releases?.[name]?.commit || record.base;
+  return inProgress && audited && expected === head;
+}
+
 export async function createSupervisor({ root, run = command, sleep = (ms, signal) => delay(ms, undefined, { signal }), signal, healthyMs = 10_000 } = {}) {
   root = path.resolve(root ?? fileURLToPath(new URL('..', import.meta.url)));
   const stateFile = path.join(root, '.state/repair.json');
@@ -170,9 +181,9 @@ export async function createSupervisor({ root, run = command, sleep = (ms, signa
     const index = await exec('git', ['ls-files', '--stage', '-z']);
     return { files, content: hash(JSON.stringify(contents)), digest: hash(JSON.stringify([status, index, contents])) };
   };
-  const packageIdentity = async (allowInvalid = false) => {
+  const packageIdentity = async (allowInvalid = false, committed = false) => {
     let pkg;
-    try { pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')); }
+    try { pkg = JSON.parse(committed ? await git('show', 'HEAD:package.json') : await readFile(path.join(root, 'package.json'), 'utf8')); }
     catch (error) {
       if (!allowInvalid || !(error instanceof SyntaxError || error.code === 'ENOENT')) throw error;
       if (state.package) return state.package; // Incomplete owned edits must remain repairable.
@@ -187,7 +198,7 @@ export async function createSupervisor({ root, run = command, sleep = (ms, signa
       }
       if (!found) throw new Error('No valid publication identity in recent manifest history');
     }
-    return hash(JSON.stringify([pkg.name, pkg.publishConfig, pkg.repository]));
+    return hash(JSON.stringify([pkg.name, Boolean(pkg.private), pkg.publishConfig, pkg.repository]));
   };
   const requirePackage = async () => {
     if (await packageIdentity() !== state.package) throw new Error('Publication identity must be restored');
@@ -288,13 +299,22 @@ export async function createSupervisor({ root, run = command, sleep = (ms, signa
       failurePhase = 'config';
       const model = parseModelEnv(await readFile(path.join(root, '.env'), 'utf8'));
       failurePhase = 'blocked';
+      await exec('flock', ['--nonblock', path.join(root, '.state/run.lock'), 'true']);
       if (!state.head) {
-        if ((await git('status', '--porcelain=v1', '--untracked-files=all')).length) throw new Error('Dirty starting checkout');
-        const remote = await remoteHead();
         let head = await git('rev-parse', 'HEAD');
+        const dirty = Boolean((await git('status', '--porcelain=v1', '--untracked-files=all')).length);
+        let handoff = false;
+        if (dirty) {
+          let appState;
+          try { appState = JSON.parse(await readFile(path.join(root, '.state/state.json'), 'utf8')); } catch {}
+          handoff = agentOwnsCheckout(root, head, appState);
+          if (!handoff || (await snapshot()).files.some(protectedPath)) throw new Error('Dirty starting checkout is not owned by an Evergreen agent');
+        }
+        const remote = await remoteHead();
         const branch = await git('branch', '--show-current');
         if (branch !== remote.branch) throw new Error('Checkout must use origin current default branch');
         if (head !== remote.head) {
+          if (dirty) throw new Error('Do not merge upstream over unfinished agent edits');
           await git('fetch', '--no-tags', 'origin', `refs/heads/${branch}`);
           if (await git('rev-parse', 'FETCH_HEAD') !== remote.head) throw new Error('Origin moved during fetch; retry');
           // ff-only alone accepts an already-ahead checkout. Require ancestry before merging.
@@ -307,7 +327,7 @@ export async function createSupervisor({ root, run = command, sleep = (ms, signa
           head = await git('rev-parse', 'HEAD');
           if (head !== remote.head || (await snapshot()).files.length) throw new Error('Fast-forward verification failed');
         }
-        Object.assign(state, { head, branch, remote: await remoteIdentity(), package: await packageIdentity(true),
+        Object.assign(state, { head, branch, remote: await remoteIdentity(), package: await packageIdentity(true, handoff),
           protected: await protectedDigest(), owned: await snapshot() });
         await save('owned');
       }

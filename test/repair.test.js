@@ -36,6 +36,7 @@ async function fixture(t) {
     const event = { bin, args, opts }; events.push(event);
     assert.equal(opts.cwd, repo);
     assert.equal(opts.env.PI_EVERGREEN_REPAIR_ACTIVE, '1');
+    if (bin === 'flock') return '';
     if (bin === 'git') {
       if (args[0] === 'push' && control.failPush) throw new Error('sensitive push authentication output');
       const output = await command(bin, args, { ...opts, timeout: 10_000 });
@@ -416,4 +417,28 @@ test('temporarily malformed owned package.json remains repairable but cannot dep
   };
   assert.equal(await s.cycle(), true);
   assert.equal((await f.git('show', '--pretty=', '--name-only', 'HEAD')).trim(), 'app.js');
+});
+
+
+test('repair can take over unfinished app edits explicitly owned by Evergreen', async t => {
+  const f = await fixture(t);
+  const head = (await f.git('rev-parse', 'HEAD')).trim();
+  await mkdir(path.join(f.root, '.state'), { recursive: true });
+  await writeFile(path.join(f.root, '.state/state.json'), JSON.stringify({ targetVersion: '1.4.0', checkouts: { app: { dir: f.root, base: head } }, workerReports: { app: { phase: 'maintenance' } } }));
+  await writeFile(path.join(f.root, 'app.js'), 'unfinished agent fix\n');
+  const s = await f.make();
+  assert.equal(await s.cycle(), true);
+  assert.equal(s.state.phase, 'done');
+});
+
+test('repair waits for a running maintenance job before attempting validation or model calls', async t => {
+  const f = await fixture(t);
+  const run = async (bin, args, opts) => {
+    if (bin === 'flock') throw Error('maintenance holds run lock');
+    return f.options.run(bin, args, opts);
+  };
+  const s = await createSupervisor({ ...f.options, run });
+  assert.equal(await s.cycle(), false);
+  assert.equal(calls(f, 'pi', '--print').length, 0);
+  assert.equal(calls(f, 'node').length, 0);
 });
