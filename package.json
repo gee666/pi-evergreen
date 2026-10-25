@@ -3,30 +3,16 @@
   "version": "0.1.0",
   "type": "module",
   "description": "Nightly Pi extension compatibility maintenance",
-  "engines": {
-    "node": ">=22.19"
-  },
+  "engines": { "node": ">=26" },
   "scripts": {
-    "start": "node src/cli.js",
-    "once": "node src/cli.js --once",
-    "test": "node --test",
-    "check": "node --check src/cli.js && node --check src/evergreen.js && node --check src/runtime.js && node --check src/metadata.js && node --check src/cleanup.js && node --check src/repair-trigger.js && node --check scripts/repair.mjs && node --check src/npm-auth.js && node --check src/pi-runtime.js"
+    "start": "node --env-file=.env src/run.ts",
+    "check": "tsc --noEmit",
+    "test": "node --test"
   },
-  "dependencies": {
-    "dotenv": "^18.0.9",
-    "node-cron": "^4.2.1",
-    "semver": "^7.7.3"
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^6.0.0"
   },
-  "bin": {
-    "pi-evergreen": "src/cli.js"
-  },
-  "files": [
-    "src/",
-    "scripts/",
-    ".env.example",
-    "README.md",
-    "LICENSE"
-  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gee666/pi-evergreen.git"
