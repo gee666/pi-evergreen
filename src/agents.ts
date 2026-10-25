@@ -1,4 +1,3 @@
-import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -30,12 +29,17 @@ async function spawnAgent(cwd: string, text: string, config: Config,
   return result.code;
 }
 
+// Committed, not merely present: a crashed first run can leave an uncommitted EVERGREEN.md.
+async function isInitialized(repoPath: string): Promise<boolean> {
+  const result = await command('git', ['cat-file', '-e', 'HEAD:EVERGREEN.md'], repoPath);
+  return result.code === 0;
+}
+
 export async function firstRuns(repos: Repo[], config: Config, runDir: string,
   env: NodeJS.ProcessEnv, pullFailures: string[]): Promise<Repo[]> {
   console.log('Initializing repositories without EVERGREEN.md in parallel');
   const initialized = await Promise.all(repos.map(async (repo) => {
-    const evergreen = join(repo.path, 'EVERGREEN.md');
-    if (existsSync(evergreen)) return repo;
+    if (await isInitialized(repo.path)) return repo;
     const log = join(runDir, `first-run-${repo.name}.log`);
     console.log(`Initializing ${repo.name}, log: ${log}`);
     const text = await prompt('first-run', {
@@ -43,7 +47,7 @@ export async function firstRuns(repos: Repo[], config: Config, runDir: string,
       pullFailures: pullFailures.join('\n') || 'None',
     });
     const code = await spawnAgent(repo.path, text, config, env, log);
-    if (code === 0 && existsSync(evergreen)) {
+    if (code === 0 && await isInitialized(repo.path)) {
       console.log(`Initialized ${repo.name}`);
       return repo;
     }
