@@ -125,13 +125,13 @@ test('tests override SDK to current Pi and missing tests are failures', async t 
   assert.equal((await testRepo(async () => '', repo, c, dir, 'initial')).passed, false);
 });
 
-async function workflowFixture(t, { changed = false, failTests = false, previous, failPublish = false, knowledge = true, relevant = changed } = {}) {
+async function workflowFixture(t, { changed = false, failTests = false, previous, failPublish = false, knowledge = true, relevant = changed, privatePackage = false, published = true } = {}) {
   const dir = await fixture(t);
   const extensionDir = path.join(dir, 'extensions');
   const repoDir = path.join(extensionDir, 'pi-test');
   const stateDir = path.join(dir, 'state');
   await mkdir(repoDir, { recursive: true });
-  await save(path.join(repoDir, 'package.json'), { name: 'pi-test-package', version: '1.0.0', scripts: { test: 'echo ok' } });
+  await save(path.join(repoDir, 'package.json'), { name: 'pi-test-package', private: privatePackage, version: '1.0.0', scripts: { test: 'echo ok' } });
   if (previous) await save(path.join(stateDir, 'state.json'), { version: previous, releases: {} });
   const knowledgePath = path.join(stateDir, 'extensions.md');
   await mkdir(stateDir, { recursive: true });
@@ -175,7 +175,7 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
         const pkg = await json(path.join(opts.cwd, 'package.json')); pkg.version = a[1];
         await save(path.join(opts.cwd, 'package.json'), pkg); dirty = true;
       }
-      if (a[0] === 'view') return '["1.0.0"]';
+      if (a[0] === 'view') { if (!published) throw Error('E404 Package not found'); return '["1.0.0"]'; }
       if (a[0] === 'publish' && publishFailure) { publishFailure = false; throw Error('registry unavailable'); }
       return '';
     }
@@ -461,4 +461,32 @@ test('inactive repository knowledge is retained but omitted from active changelo
   const assessment = f.calls.find(c => c.b === 'pi' && c.a.includes('--no-tools'));
   assert.doesNotMatch(assessment.opts.input, /Retired-extension-sentinel/);
   assert.equal((await readKnowledge(f.knowledgePath))['pi-archived'], 'Retired-extension-sentinel');
+});
+
+
+test('private packages retain git-only releases without npm publication or registry checks', async t => {
+  const f = await workflowFixture(t, { previous: '1.3.0', changed: true, privatePackage: true });
+  await evergreen(f.c, { run: f.run });
+  assert.ok(f.calls.some(c => c.b === 'git' && c.a[0] === 'commit'));
+  assert.ok(f.calls.some(c => c.b === 'git' && c.a[0] === 'push'));
+  assert.ok(!f.calls.some(c => c.b === 'npm' && ['publish', 'view', 'whoami'].includes(c.a[0])));
+  assert.equal((await json(f.stateFile)).releases['pi-test'].publish, false);
+  assert.equal((await json(f.stateFile)).releases['pi-test'].phase, 'done');
+  assert.equal((await json(path.join(f.sourceDir, 'package.json'))).private, true);
+});
+
+test('release refuses an unexpected private-to-public policy change', async t => {
+  const dir = await fixture(t);
+  await save(path.join(dir, 'package.json'), { name: 'fixture', version: '1.0.0', private: false });
+  await assert.rejects(release(async () => '', { dir, packagePolicy: { name: 'fixture', private: true } }, {}, {}, async () => {}, dir), /Publication target/);
+});
+
+
+test('unpublished npm packages receive GitHub releases only, never an initial npm publication', async t => {
+  const f = await workflowFixture(t, { previous: '1.3.0', changed: true, published: false });
+  await evergreen(f.c, { run: f.run });
+  assert.ok(f.calls.some(c => c.b === 'git' && c.a[0] === 'push'));
+  assert.ok(!f.calls.some(c => c.b === 'npm' && c.a[0] === 'publish'));
+  assert.equal((await json(f.stateFile)).releases['pi-test'].publish, false);
+  assert.equal((await json(f.stateFile)).releases['pi-test'].phase, 'done');
 });
