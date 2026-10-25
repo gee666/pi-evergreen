@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'dotenv';
+import { readTestCommands, atomicText } from './metadata.js';
 
 export const expand = (p) => path.resolve(p.replace(/^~(?=\/|$)/, homedir()));
 export async function json(file, fallback) {
@@ -12,9 +13,7 @@ export async function json(file, fallback) {
 }
 export async function save(file, value) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const temp = `${file}.${process.pid}.tmp`;
-  await writeFile(temp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
-  await rename(temp, file);
+  await atomicText(file, JSON.stringify(value, null, 2) + '\n');
 }
 
 export function modelSpec(value, key) {
@@ -33,14 +32,16 @@ export async function config(file = fileURLToPath(new URL('../.env', import.meta
     if (error.code === 'ENOENT') throw new Error(`Missing Evergreen env file: ${file}. Fill in the blank .env.example template and save it as .env.`);
     throw error;
   }
-  const keys = ['PI-EXTENSIONS-DIR', 'PI-STATE-DIR', 'PI-GITHUB-OWNER', 'PI-AGENT-MODEL', 'PI-E2E-MODEL', 'PI-TIMEZONE', 'PI-CONCURRENCY', 'PI-COMMAND-TIMEOUT-MS', 'PI-AGENT-TIMEOUT-MS', 'PI-PUBLISH-ACCESS'];
+  const keys = ['PI-EXTENSIONS-DIR', 'PI-GITHUB-OWNER', 'PI-AGENT-MODEL', 'PI-E2E-MODEL', 'PI-TIMEZONE', 'PI-CONCURRENCY', 'PI-COMMAND-TIMEOUT-MS', 'PI-AGENT-TIMEOUT-MS', 'PI-PUBLISH-ACCESS'];
   const missing = keys.filter(key => !values[key]?.trim());
   if (missing.length) throw new Error(`Missing required Evergreen settings in ${file}: ${missing.join(', ')}`);
   const agent = modelSpec(values['PI-AGENT-MODEL'], 'PI-AGENT-MODEL');
   const e2e = modelSpec(values['PI-E2E-MODEL'], 'PI-E2E-MODEL');
+  const appDir = path.dirname(path.resolve(file));
   const result = {
+    appDir, envFile: path.resolve(file), tmpDir: path.join(appDir, 'tmp'),
     extensionsDir: expand(values['PI-EXTENSIONS-DIR']),
-    stateDir: expand(values['PI-STATE-DIR']),
+    stateDir: path.join(appDir, '.state'),
     owner: values['PI-GITHUB-OWNER'],
     provider: agent.provider, model: agent.model, reasoning: agent.reasoning,
     e2eProvider: e2e.provider, e2eModel: e2e.model, e2eReasoning: e2e.reasoning,
@@ -49,7 +50,7 @@ export async function config(file = fileURLToPath(new URL('../.env', import.meta
     commandTimeoutMs: Number(values['PI-COMMAND-TIMEOUT-MS']),
     agentTimeoutMs: Number(values['PI-AGENT-TIMEOUT-MS']),
     publishAccess: values['PI-PUBLISH-ACCESS'],
-    testCommands: values['PI-TEST-COMMANDS']?.trim() ? JSON.parse(values['PI-TEST-COMMANDS']) : undefined,
+    testCommands: readTestCommands(values),
   };
   if (!/^[\w.-]+$/.test(result.owner)) throw new Error('PI-GITHUB-OWNER is invalid');
   if (!Number.isInteger(result.concurrency) || result.concurrency < 1 || result.concurrency > 8) throw new Error('PI-CONCURRENCY must be 1..8');
@@ -57,7 +58,6 @@ export async function config(file = fileURLToPath(new URL('../.env', import.meta
     if (!Number.isSafeInteger(result[key]) || result[key] < 1000) throw new Error(`${key} must be an integer >= 1000`);
   }
   if (!['public', 'restricted'].includes(result.publishAccess)) throw new Error('PI-PUBLISH-ACCESS must be public or restricted');
-  if (result.testCommands !== undefined && (!result.testCommands || typeof result.testCommands !== 'object' || Array.isArray(result.testCommands))) throw new Error('PI-TEST-COMMANDS must be a JSON object');
   new Intl.DateTimeFormat('en', { timeZone: result.timezone });
   return result;
 }

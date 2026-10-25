@@ -8,12 +8,12 @@ Nightly maintenance for your active GitHub `pi-*` repositories. A Node process r
 2. Try `pi update`. On failure, run `mise upgrade pi` and `mise reshim`. Read back `pi --version`, then run `pi update --extensions`.
 3. Discover the configured owner's active `pi-*` repositories through authenticated, paginated GitHub API calls. Discovery includes private repositories when the owner is the authenticated account. Archived, disabled and deleted repositories are not maintained. Previously cloned inactive repositories stay untouched on disk.
 4. Clone missing repositories and fast-forward existing default branches into `extensionsDir`. Refuse dirty checkouts, unexpected origins, wrong branches and unrelated unpushed commits. Never reset user work or force-push.
-5. If Pi's version matches the last completed run, stop after synchronization. With no saved version, perform the full first-run audit.
-6. Create persistent, Evergreen-owned working copies under `stateDir`. Agents and build tools work there, not in your canonical checkouts. Install dependencies without install scripts, override declared Pi SDK dependencies to the target version, verify installed SDK versions, then run tests. Legacy `@mariozechner/pi-*` names and npm aliases map to the current SDK. Missing tests are a failure.
-7. On the first run, launch one Pi subagent per extension for a thorough intent and coverage audit, even if a knowledge file already exists. Create or refresh `PI_COMPATIBILITY.md`, identify fragile assumptions, and add meaningful unit, integration and e2e tests as needed. Newly discovered extensions without knowledge get this audit on their next compatibility check.
+5. If Pi's version matches the last completed run and all active repositories have their knowledge and saved test commands, stop after synchronization. Missing first-run metadata or unfinished workers still require work. With no saved version, perform the full first-run audit.
+6. Create persistent, Evergreen-owned working copies under `.state/`. Agents and build tools work there, not in your canonical checkouts. Install dependencies without install scripts, override declared Pi SDK dependencies to the target version, verify installed SDK versions, then run tests. Legacy `@mariozechner/pi-*` names and npm aliases map to the current SDK. Missing tests are a failure.
+7. On the first run, launch one Pi subagent per extension for a thorough intent and coverage audit, even if a knowledge file already exists. Create or refresh its section in the single shared `.state/extensions.md`, identify fragile assumptions, and add meaningful unit, integration and e2e tests as needed. Newly discovered extensions without knowledge or a saved test-command entry get this audit on their next compatibility check. Agents also report the full test commands for their own extension; the parent writes these entries into `.env` serially.
 8. Fetch the changelog at the installed Pi release tag. A read-only Pi session compares all intervening changes with every extension's knowledge and test results. It returns a relevance decision and migration reasoning for each repository.
 9. Launch maintenance subagents only for relevant changes or failing tests. Unrelated scrollbar changes with passing tests do not trigger a worker for SSH tool routing. New tools or changed execution behavior do. Internal dependencies warrant careful behavioral assessment, not an unconditional worker for unrelated changes.
-10. Workers fix compatibility, adopt useful public APIs, preserve all existing functionality, and keep tests and knowledge current. Re-test changes, bump the npm patch version, test the release version, commit, push the default branch, then publish to npm. An unchanged review gets no empty release. First-run knowledge/test changes count as real changes.
+10. Workers fix compatibility, adopt useful public APIs, preserve all existing functionality, and keep tests and knowledge current. Re-test changes, bump the npm patch version, test the release version, commit, push the default branch, then publish to npm. An unchanged review gets no empty release. Knowledge is local bookkeeping, not a reason by itself to publish an extension. Changes to its tests or implementation count as real changes.
 11. Record the completed Pi version only after all required work succeeds. Journals resume interrupted pushes and publications without another patch bump. Existing npm versions must match the recorded commit's `gitHead`, or publication recovery fails.
 
 Subagents are independent Pi CLI processes, with configurable concurrency. They do not depend on a particular Pi subagent extension. Extension discovery is disabled for maintenance sessions to avoid recursive delegation and interactive extension dialogs. The main changelog session has no tools. Prompts travel through stdin so a long first-run changelog does not exceed OS argument limits.
@@ -42,7 +42,7 @@ Workers must make generated e2e tests honor these variables. They should keep re
 Evergreen reads **its own `.env` in the application root**. It does not read Pi settings and does not infer application settings from ambient environment variables. Pi itself still uses its normal independent credentials.
 
 - `.env.example` is committed. All values are blank, not defaults.
-- `.env` is your local fill-in file, ignored by Git. A blank copy is provided on this machine with mode 0600.
+- `.env` is your local file, ignored by Git and kept at mode 0600. On omarchy-red it has been filled in using the requested model selections and this machine's paths. The committed example stays blank.
 - No template is copied automatically by the runner or service installer.
 - Missing required values fail validation before updates, model calls or repository changes.
 
@@ -51,7 +51,6 @@ Required keys:
 | Key | Meaning |
 | --- | --- |
 | `PI-EXTENSIONS-DIR` | Canonical extension checkout directory |
-| `PI-STATE-DIR` | Evergreen state, logs and managed working copies |
 | `PI-GITHUB-OWNER` | GitHub account owning the repositories |
 | `PI-AGENT-MODEL` | Maintenance provider/model/reasoning-level |
 | `PI-E2E-MODEL` | Independent e2e provider/model/reasoning-level |
@@ -70,13 +69,15 @@ PI-E2E-MODEL=openai/gpt-6-luna/low
 
 Choose the provider that actually provides the model and has credentials on this machine. Reasoning is mandatory: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Maintenance invocations pass it explicitly through `--thinking`; generated e2e tests must do the same using their separate selection. Pi may clamp unsupported reasoning levels to a model's capabilities.
 
-The optional `PI-TEST-COMMANDS` value is a JSON object of repository-specific shell commands:
+There is no manual test-command mapping setting. During the first run, each extension agent discovers, adds and runs its full test suites, then reports the commands to the parent. Evergreen appends an automatic entry for that repository, such as:
 
 ```dotenv
-PI-TEST-COMMANDS='{"pi-example":["npm test","npm run integration","npm run check"]}'
+PI-TEST-COMMANDS-pi-example='["npm test","npm run check","npm run test:e2e"]'
 ```
 
-Commands are trusted shell commands run with `bash -o pipefail`. Empty command arrays are rejected. An existing `test:e2e` script still runs even with custom commands unless already included. Non-npm projects need an npm package/test setup before this runner can publish them.
+Only the parent writes `.env`, one update at a time. It preserves other entries, comments and model selections. Later workers keep their own mapping current if scripts change. Entries with unusually complex quoting may use a `base64:` encoded JSON value for exact round-tripping. Normal entries remain readable JSON arrays.
+
+Commands are trusted shell commands run with `bash -o pipefail`. Empty or multiline commands are rejected. An existing `test:e2e` script still runs even if absent from a reported command list. Before an extension has a saved mapping, Evergreen discovers npm test/check/build/e2e scripts for the initial check. Non-npm projects need an npm package/test setup before this runner can publish them.
 
 Paths should be absolute or start with `~`. The hyphenated keys are parsed by dotenv directly. Do not `source .env` into a shell or load it as a systemd EnvironmentFile: those mechanisms do not support these variable names consistently.
 
@@ -125,7 +126,9 @@ systemctl --user disable --now pi-evergreen
 
 A fresh Node process runs each nightly workflow, picking up code changes. Scheduler code, dependencies and timezone changes require a service restart. The application `.env`, including model selections and reasoning, is read each run. A kernel advisory lock prevents overlapping runs and releases automatically on exit or reboot.
 
-## Knowledge format
+## Shared knowledge format
+
+`.state/extensions.md` has one section per extension. Agents return their own Markdown fragment; the parent merges it without overwriting the other sections. Small HTML section markers identify update boundaries. They do not change the rendered Markdown. Do not remove those markers.
 
 ```md
 <!-- pi-evergreen: {"usesUndocumentedApis": true} -->
@@ -142,9 +145,42 @@ A fresh Node process runs each nightly workflow, picking up code changes. Schedu
 
 Workers must audit code before setting `usesUndocumentedApis` to false. Undocumented behavior counts, even without a private import. Missing or invalid declarations are treated as unknown internal dependencies, never as proof of safety. Knowledge stays short, roughly 40 lines, and records real coverage and remaining limitations honestly.
 
+## Independent self-repair
+
+The scheduler and repair supervisor are separate systemd user services. A workflow error makes the scheduler exit unsuccessfully; its `OnFailure` starts `pi-evergreen-repair.service`. Startup/import failures use the same trigger. Errors from a manual `--once` run also request that separate service. `--check-config` is diagnostic and never starts repair.
+
+The repair supervisor is `scripts/repair.mjs`, a standalone Node program using only built-in modules, not Evergreen's imports or npm dependencies. It remains alive while stopping, repairing, testing and restarting the main app. systemd restarts the supervisor itself if it crashes. A separate repair lock prevents duplicate supervisors.
+
+It uses the configured `PI-AGENT-MODEL` and reasoning. It asks an agent to fix real bugs without changing the system's purpose, deleting data, weakening tests, bypassing authentication or changing your model choices. It validates externally rather than trusting the agent's final response. The intended sequence is dependency installation, tests, checks, a full `--once` validation, deployment, a short healthy-service observation, then commit and push. Failures loop with backoff. After a successful push and running-service check, the supervisor exits.
+
+During repair validation, Evergreen's own repository is handled by the supervisor's tests and commit/deployment transaction, not a second extension worker. Other extension repositories still follow the ordinary workflow. This avoids a dirty canonical self-checkout or competing self-release while repair is in progress. Recursive repair triggers are suppressed only inside supervisor validation.
+
+Pre-existing user edits are not automatically swept into a repair commit. Repair-created changes and phase information survive retries. `.env`, `.state/`, `tmp/`, credentials and protected instruction files are excluded from repair commits. The supervisor itself is protected from its repair agent's edits.
+
+Missing model credentials cannot be repaired by inventing a login. The supervisor waits and retries authentication rather than spending repeated model calls, switching providers or disabling requirements. GitHub/npm permissions, outages and publication conflicts can also require external action. This is a recovery loop, not a promise that software or external services can never fail.
+
+```sh
+systemctl --user status pi-evergreen pi-evergreen-repair
+journalctl --user -u pi-evergreen-repair -f
+# Start recovery manually if needed:
+systemctl --user start pi-evergreen-repair
+```
+
+Self-repair requires this Git checkout, a writable origin, valid credentials and a working Node/Pi executable. Keep the checkout, `.env` and local state owned by the maintenance account.
+
 ## Recovery and limits
 
-`stateDir/state.json` records versions, working copies, first-run audits and release journals. `stateDir/runs/` contains test results, changelogs, model responses and errors. Working copies under `stateDir/workspaces/<pi-version>/<repo>/` retain interrupted edits for retry. Canonical checkouts only receive fast-forward pulls and get release commits on their next synchronization. Logs and old working copies are retained and can consume disk space.
+The state location is fixed inside the application. There is no state-directory setting:
+
+- `.state/extensions.md`: one plain Markdown file with a section per extension, its intent, dependencies, weaknesses, test coverage and useful API opportunities.
+- `.state/state.json`: last completed Pi version, working-copy identities, first-run audit records and release journals.
+- `.state/runs/`: test results, changelogs, model responses and errors.
+- `.state/workspaces/<pi-version>/<repo>/`: managed working copies retaining interrupted edits for retry.
+- `tmp/`: disposable development/test artifacts.
+
+Both `.state/` and `tmp/` are Git-ignored. Each run cleans run logs older than 14 days and top-level temporary entries older than 7 days, under the exclusive run lock. Cleanup does not follow symlinks or remove shared knowledge, version history, recovery journals or working copies. Those working copies are retained for recovery and can consume disk space.
+
+Canonical checkouts only receive fast-forward pulls and get release commits on their next synchronization.
 
 After a push or publication failure, fix credentials/access and rerun rather than deleting the journal. Pending repositories that disappear, become archived, transfer ownership or change default branch block recovery instead of being published blindly. Inspect and deliberately resolve/cancel such journals. Unexpected package identity or Git changes require inspection of the managed working copy; the runner does not discard them automatically.
 

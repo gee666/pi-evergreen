@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile, readFile, cp } from 'node:fs/promises';
 import path from 'node:path';
-import { activeRepos, updatePi, parseVersion, changelogRange, parseAnalysis, discover, syncRepo, testRepo, release, evergreen, usesUndocumentedApis, behavioralReview, registryVersions, assertReleaseFiles, intentTestInstructions } from '../src/evergreen.js';
+import { activeRepos, updatePi, parseVersion, changelogRange, parseAnalysis, discover, syncRepo, testRepo, release, evergreen, usesUndocumentedApis, behavioralReview, registryVersions, assertReleaseFiles, intentTestInstructions, maintenanceRepos } from '../src/evergreen.js';
 import { command, config, lock, pool, save, json } from '../src/runtime.js';
+import { readKnowledge, writeKnowledge } from '../src/metadata.js';
 
 const root = path.resolve('tmp/tests');
-const explicitEnv = dir => ({ 'PI-EXTENSIONS-DIR': dir, 'PI-STATE-DIR': path.join(dir, 'state'), 'PI-GITHUB-OWNER': 'gee666', 'PI-AGENT-MODEL': 'openai-codex/gpt-6.1-sol/medium', 'PI-E2E-MODEL': 'openai-codex/gpt-6-luna/low', 'PI-TIMEZONE': 'UTC', 'PI-CONCURRENCY': '2', 'PI-COMMAND-TIMEOUT-MS': '1200000', 'PI-AGENT-TIMEOUT-MS': '5400000', 'PI-PUBLISH-ACCESS': 'public' });
+const explicitEnv = dir => ({ 'PI-EXTENSIONS-DIR': dir, 'PI-GITHUB-OWNER': 'gee666', 'PI-AGENT-MODEL': 'openai-codex/gpt-6.1-sol/medium', 'PI-E2E-MODEL': 'openai-codex/gpt-6-luna/low', 'PI-TIMEZONE': 'UTC', 'PI-CONCURRENCY': '2', 'PI-COMMAND-TIMEOUT-MS': '1200000', 'PI-AGENT-TIMEOUT-MS': '5400000', 'PI-PUBLISH-ACCESS': 'public' });
 const writeEnv = (file, values) => writeFile(file, Object.entries(values).map(([key, value]) => `${key}='${value}'`).join('\n'));
 
 async function fixture(t) {
@@ -79,6 +80,8 @@ test('config reads only the application env file with explicit model reasoning',
   assert.equal(c.reasoning, 'medium');
   assert.equal(c.e2eReasoning, 'low');
   assert.equal(c.extensionsDir, dir);
+  assert.equal(c.stateDir, path.join(dir, '.state'));
+  assert.equal(c.tmpDir, path.join(dir, 'tmp'));
 });
 
 test('exclusive lock rejects overlapping runs and releases', async t => {
@@ -130,7 +133,11 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
   await mkdir(repoDir, { recursive: true });
   await save(path.join(repoDir, 'package.json'), { name: 'pi-test-package', version: '1.0.0', scripts: { test: 'echo ok' } });
   if (previous) await save(path.join(stateDir, 'state.json'), { version: previous, releases: {} });
-  if (knowledge) await writeFile(path.join(repoDir, 'PI_COMPATIBILITY.md'), '<!-- pi-evergreen: {"usesUndocumentedApis": false} -->\n# Compatibility\nTool execution hooks are relevant.');
+  const knowledgePath = path.join(stateDir, 'extensions.md');
+  await mkdir(stateDir, { recursive: true });
+  if (knowledge) await writeKnowledge(knowledgePath, { 'pi-test': '<!-- pi-evergreen: {"usesUndocumentedApis": false} -->\n# Compatibility\nTool execution hooks are relevant.' });
+  const envFile = path.join(dir, '.env');
+  await writeEnv(envFile, { ...explicitEnv(extensionDir), ...(knowledge ? { 'PI-TEST-COMMANDS-pi-test': '["npm test"]' } : {}) });
   const calls = [];
   let piVersion = '1.4.0';
   let dirty = false, head = 'base', initialFailure = failTests, publishFailure = failPublish;
@@ -140,9 +147,9 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
       if (a[0] === '--version') return piVersion;
       if (a.includes('--no-tools')) return JSON.stringify({ breaking: changed, usefulFeatures: false, summary: 'Review APIs', extensions: [{ name: 'pi-test', relevant, reason: relevant ? 'Changed tool execution API' : 'Unrelated scrollbar change' }] });
       if (a.includes('--print')) {
-        if (opts.input.includes('first-run compatibility knowledge subagent')) { await writeFile(path.join(opts.cwd, 'PI_COMPATIBILITY.md'), '<!-- pi-evergreen: {"usesUndocumentedApis": false} -->\n# Compatibility\nTools matter; scrollbar does not. Test: routes new tools'); dirty = true; }
+        if (opts.input.includes('first-run compatibility knowledge subagent')) dirty = true;
         else dirty = changed || failTests;
-        initialFailure = false; return 'Updated';
+        initialFailure = false; return JSON.stringify({ knowledge: '<!-- pi-evergreen: {"usesUndocumentedApis": false} -->\n# Compatibility\nTools matter; scrollbar does not. Test: routes new tools', testCommands: ['npm test'] });
       }
       return '';
     }
@@ -156,7 +163,7 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
       if (a.includes('--show-toplevel')) return opts.cwd;
       if (a[0] === 'remote') return 'https://github.com/gee666/pi-test.git';
       if (a[0] === 'branch') return 'master';
-      if (a[0] === 'status') return dirty ? ' M index.js' : '';
+      if (a[0] === 'status') return opts.cwd !== repoDir && dirty ? ' M index.js' : '';
       if (a[0] === 'rev-list') return '0';
       if (a[0] === 'rev-parse') return head;
       if (a[0] === 'commit') { head = 'release-commit'; dirty = false; }
@@ -174,8 +181,8 @@ async function workflowFixture(t, { changed = false, failTests = false, previous
     }
     throw Error('Unexpected command ' + b);
   };
-  const c = { extensionsDir: extensionDir, stateDir, concurrency: 2, testCommands: {}, provider: 'openai-codex', model: 'gpt-6.1-sol', e2eProvider: 'openai-codex', e2eModel: 'gpt-6-luna', reasoning: 'medium', e2eReasoning: 'low', piVersion: '1.4.0', publishAccess: 'public' };
-  return { c, run, calls, sourceDir: repoDir, setPiVersion: v => { piVersion = v; }, stateFile: path.join(stateDir, 'state.json') };
+  const c = { appDir: dir, envFile, tmpDir: path.join(dir, 'tmp'), extensionsDir: extensionDir, stateDir, concurrency: 2, testCommands: knowledge ? { 'pi-test': ['npm test'] } : {}, provider: 'openai-codex', model: 'gpt-6.1-sol', e2eProvider: 'openai-codex', e2eModel: 'gpt-6-luna', reasoning: 'medium', e2eReasoning: 'low', piVersion: '1.4.0', publishAccess: 'public' };
+  return { c, run, calls, knowledgePath, sourceDir: repoDir, setPiVersion: v => { piVersion = v; }, stateFile: path.join(stateDir, 'state.json') };
 }
 
 test('unchanged Pi still updates extensions and syncs but skips tests and AI', async t => {
@@ -254,6 +261,9 @@ test('first-run worker creates knowledge and tests before focused changelog anal
   assert.match(sessions[0].opts.input, /first-run compatibility knowledge subagent/);
   assert.match(sessions[1].opts.input, /Tools matter; scrollbar does not/);
   assert.equal((await json(f.stateFile)).releases['pi-test'].phase, 'done');
+  assert.match((await readKnowledge(f.knowledgePath))['pi-test'], /Tools matter/);
+  assert.deepEqual((await config(f.c.envFile)).testCommands['pi-test'], ['npm test']);
+  await assert.rejects(readFile(path.join(f.sourceDir, 'PI_COMPATIBILITY.md')), { code: 'ENOENT' });
 });
 
 test('per-extension assessment must cover each repository exactly once', () => {
@@ -381,7 +391,7 @@ test('missing or invalid env settings fail instead of inventing defaults', async
   const dir = await fixture(t);
   const file = path.join(dir, '.env');
   await assert.rejects(config(file), /Missing Evergreen env file/);
-  for (const key of ['PI-E2E-MODEL', 'PI-AGENT-MODEL', 'PI-CONCURRENCY', 'PI-STATE-DIR']) {
+  for (const key of ['PI-E2E-MODEL', 'PI-AGENT-MODEL', 'PI-CONCURRENCY', 'PI-GITHUB-OWNER']) {
     const values = explicitEnv(dir); values[key] = '';
     await writeEnv(file, values);
     await assert.rejects(config(file), new RegExp(key));
@@ -393,7 +403,7 @@ test('missing or invalid env settings fail instead of inventing defaults', async
 
 test('internal dependencies alone do not select an unrelated passing extension', async t => {
   const f = await workflowFixture(t, { changed: true, relevant: false, previous: '1.3.0' });
-  await writeFile(path.join(f.sourceDir, 'PI_COMPATIBILITY.md'), '<!-- pi-evergreen: {"usesUndocumentedApis": true} -->\n# Compatibility\nSSH tool-routing internals. Scrollbar changes are unrelated.');
+  await writeKnowledge(f.knowledgePath, { 'pi-test': '<!-- pi-evergreen: {"usesUndocumentedApis": true} -->\n# Compatibility\nSSH tool-routing internals. Scrollbar changes are unrelated.' });
   await evergreen(f.c, { run: f.run });
   assert.equal(f.calls.filter(c => c.a.includes('--print')).length, 1);
   assert.ok(!f.calls.some(c => c.a[0] === 'publish'));
@@ -405,4 +415,50 @@ test('committed env example contains every required key but no default values', 
   const values = parse(await readFile('.env.example', 'utf8'));
   for (const key of Object.keys(explicitEnv('/example'))) assert.ok(key in values, key);
   assert.ok(Object.values(values).every(value => value === ''));
+});
+
+test('new repositories receive first-run knowledge and env mapping even when Pi is unchanged', async t => {
+  const f = await workflowFixture(t, { previous: '1.4.0', knowledge: false });
+  await evergreen(f.c, { run: f.run });
+  assert.ok(f.calls.some(c => c.opts.input?.includes('first-run compatibility knowledge subagent')));
+  assert.match((await readKnowledge(f.knowledgePath))['pi-test'], /Tools matter/);
+  assert.deepEqual((await config(f.c.envFile)).testCommands['pi-test'], ['npm test']);
+});
+
+test('malformed worker report must be repaired on retry, even when its edited tests now pass', async t => {
+  const f = await workflowFixture(t, { previous: '1.3.0', failTests: true, relevant: false });
+  const invalidReport = async (bin, args, options) => {
+    const result = await f.run(bin, args, options);
+    if (bin === 'pi' && args.includes('--print') && !args.includes('--no-tools')) return 'not a JSON report';
+    return result;
+  };
+  await assert.rejects(evergreen(f.c, { run: invalidReport }));
+  assert.ok((await json(f.stateFile)).workerReports['pi-test']);
+  assert.equal((await json(f.stateFile)).version, '1.3.0');
+  assert.ok(!f.calls.some(c => c.a[0] === 'publish'));
+  assert.match((await readKnowledge(f.knowledgePath))['pi-test'], /Tool execution hooks/);
+  await evergreen(f.c, { run: f.run });
+  const workers = f.calls.filter(c => c.b === 'pi' && c.a.includes('--print') && !c.a.includes('--no-tools'));
+  assert.equal(workers.length, 2);
+  assert.equal((await json(f.stateFile)).workerReports['pi-test'], undefined);
+  assert.equal((await json(f.stateFile)).version, '1.4.0');
+});
+
+
+test('self-repair leaves the app to its supervisor without bypassing other extension checks', () => {
+  const repos = [{ name: 'pi-evergreen' }, { name: 'pi-ssh' }];
+  const c = { appDir: '/extensions/pi-evergreen', extensionsDir: '/extensions' };
+  assert.deepEqual(maintenanceRepos(repos, c, false), repos);
+  assert.deepEqual(maintenanceRepos(repos, c, true), [{ name: 'pi-ssh' }]);
+});
+
+test('inactive repository knowledge is retained but omitted from active changelog assessment', async t => {
+  const f = await workflowFixture(t, { previous: '1.3.0', relevant: false });
+  const notes = await readKnowledge(f.knowledgePath);
+  notes['pi-archived'] = 'Retired-extension-sentinel';
+  await writeKnowledge(f.knowledgePath, notes);
+  await evergreen(f.c, { run: f.run });
+  const assessment = f.calls.find(c => c.b === 'pi' && c.a.includes('--no-tools'));
+  assert.doesNotMatch(assessment.opts.input, /Retired-extension-sentinel/);
+  assert.equal((await readKnowledge(f.knowledgePath))['pi-archived'], 'Retired-extension-sentinel');
 });
