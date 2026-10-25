@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { command } from './io.ts';
@@ -12,7 +13,10 @@ export async function testRepos(repos: Repo[], runDir: string, env: NodeJS.Proce
   for (const repo of repos) {
     const log = join(testsDir, `${repo.name}.log`);
     console.log(`Testing ${repo.name}, log: ${log}`);
-    const install = await command('npm', ['install'], repo.path, env, log);
+    // Leave the checkout clean: repos without a committed lockfile must not get one.
+    const installArgs = existsSync(join(repo.path, 'package-lock.json'))
+      ? ['ci'] : ['install', '--no-package-lock'];
+    const install = await command('npm', installArgs, repo.path, env, log);
     const result = install.code === 0
       ? await command('npm', ['run', 'test:evergreen'], repo.path, env, log)
       : install;
